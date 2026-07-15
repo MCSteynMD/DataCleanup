@@ -5,19 +5,21 @@ Run:
     pip install -r requirements.txt
     python review_gui.py
 
-Up / Down or J / K  = next / previous match in the queue
-Left / ←            = duplicate
-Right / →           = unique
-D                   = discard
-U / Backspace       = clear → unreviewed again
-Enter               = Done → next cluster
+Up / Down           = previous / next match in the queue (arrow keys only)
+Left                = duplicate
+Right               = unique
+DISCARD / UNREVIEW  = use the on-screen buttons (no letter-key shortcuts)
+Enter               = Done -> next cluster
 O                   = open results workbook
 I                   = choose product input Excel and run similarity
                       (also prompted automatically on startup)
 S / R               = Reports screen (export for superiors)
 T                   = toggle dark mode
 
-Progress is saved per results file (review_progress__<name>.json).
+Progress is saved in separate sidecar files next to the results workbook
+(never modifies the original similarity_results*.xlsx):
+  review_progress__<name>.json
+  review_decisions__<name>.xlsx
 """
 
 from __future__ import annotations
@@ -480,6 +482,12 @@ def progress_path_for(results_path: Path) -> Path:
     return results_path.parent / f"review_progress__{safe}.json"
 
 
+def decisions_path_for(results_path: Path) -> Path:
+    """Human-readable decisions Excel — separate from the original results workbook."""
+    safe = results_path.stem.replace(" ", "_")
+    return results_path.parent / f"review_decisions__{safe}.xlsx"
+
+
 def load_progress(results_path: Path | None = None) -> dict:
     path = progress_path_for(results_path) if results_path else PROGRESS_FILE
     if not path.exists() and results_path is not None and PROGRESS_FILE.exists():
@@ -504,6 +512,7 @@ def load_progress(results_path: Path | None = None) -> dict:
 
 
 def save_progress(progress: dict, results_path: Path | None = None) -> None:
+    """Write JSON progress only. Never touches the original results workbook."""
     progress["updated_at"] = utc_now()
     if results_path is not None:
         path = progress_path_for(results_path)
@@ -512,6 +521,54 @@ def save_progress(progress: dict, results_path: Path | None = None) -> None:
         path = PROGRESS_FILE
     with path.open("w", encoding="utf-8") as f:
         json.dump(progress, f, indent=2)
+
+
+def save_decisions_workbook(
+    results_path: Path,
+    by_product: dict[str, dict],
+    progress: dict,
+) -> Path:
+    """Write a companion Excel of decisions; leaves the original results file alone."""
+    from openpyxl import Workbook
+
+    out = decisions_path_for(results_path)
+    decisions = progress.get("decisions", {})
+    rows: list[list] = []
+    for pn, dec in decisions.items():
+        item = by_product.get(pn, {})
+        status = normalize_status(dec.get("status", ""))
+        rows.append([
+            pn,
+            STATUS_LABELS.get(status, status),
+            dec.get("cluster_id", item.get("cluster_id", "")),
+            item.get("description", ""),
+            item.get("linked_to_product", ""),
+            item.get("score_to_parent", ""),
+            dec.get("updated_at", ""),
+        ])
+    rows.sort(key=lambda r: (str(r[1]), str(r[2]), str(r[0])))
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Decisions"
+    ws.append([
+        "Product", "Decision", "Cluster", "Description",
+        "Linked to", "Score to parent", "Updated (UTC)",
+    ])
+    for row in rows:
+        ws.append(row)
+
+    meta = wb.create_sheet("About", 0)
+    meta.append(["Field", "Value"])
+    meta.append(["Source results workbook", results_path.name])
+    meta.append(["Source path", str(results_path)])
+    meta.append(["Decisions file", out.name])
+    meta.append(["Updated (UTC)", progress.get("updated_at", utc_now())])
+    meta.append(["Note", "Original results workbook is never modified by the reviewer."])
+    meta.append(["Decision count", len(rows)])
+
+    wb.save(out)
+    return out
 
 
 def compute_review_stats(
@@ -1592,10 +1649,10 @@ class DecisionBar(QWidget):
         self._layout.setSpacing(12)
         self._buttons: list[tuple[QPushButton, str]] = []
         specs = (
-            ("←  DUPLICATE", "Left", "coral", "duplicate"),
-            ("UNIQUE  →", "Right", "teal", "unique"),
-            ("DISCARD", "D", "ochre", "discard"),
-            ("UNREVIEW", "U", "muted", "unreviewed"),
+            ("<-  DUPLICATE", "Left arrow", "coral", "duplicate"),
+            ("UNIQUE  ->", "Right arrow", "teal", "unique"),
+            ("DISCARD", "button", "ochre", "discard"),
+            ("UNREVIEW", "button", "muted", "unreviewed"),
         )
         for title, hint, color_key, status in specs:
             btn = QPushButton(f"{title}\n{hint}")
@@ -1752,15 +1809,11 @@ class ReviewWindow(QMainWindow):
             sc.setContext(Qt.ShortcutContext.WindowShortcut)
             sc.activated.connect(slot)
 
+        # Marks and navigation: arrow keys only (no D/U/J/K letter shortcuts).
         bind("Left", lambda: self._mark_focused("duplicate"))
         bind("Right", lambda: self._mark_focused("unique"))
-        bind("D", lambda: self._mark_focused("discard"))
-        bind("U", self._clear_focused)
-        bind("Backspace", self._clear_focused)
         bind("Up", lambda: self._move_focus(-1))
-        bind("K", lambda: self._move_focus(-1))
         bind("Down", lambda: self._move_focus(1))
-        bind("J", lambda: self._move_focus(1))
         bind("Return", self._finish_cluster_and_next)
         bind("Enter", self._finish_cluster_and_next)
         bind("O", self._pick_results)
@@ -1771,6 +1824,19 @@ class ReviewWindow(QMainWindow):
         bind("Escape", self._toggle_fullscreen)
         bind("Ctrl+Left", self._prev_cluster)
         bind("Ctrl+Right", self._finish_cluster_and_next)
+
+    def _persist(self) -> None:
+        """Save progress JSON + companion decisions Excel; never alter original results."""
+        save_progress(self.progress, self.results_path)
+        if self.results_path is None:
+            return
+        if not self.by_product:
+            return
+        try:
+            save_decisions_workbook(self.results_path, self.by_product, self.progress)
+        except OSError:
+            # Excel lock / permission — JSON is already safe; ignore companion write.
+            pass
 
     def _refocus_window(self) -> None:
         self.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -1786,7 +1852,7 @@ class ReviewWindow(QMainWindow):
         apply_theme_palette(dark=not Theme.dark)
         _sync_legacy_color_aliases()
         self.progress["dark_mode"] = Theme.dark
-        save_progress(self.progress, self.results_path)
+        self._persist()
         self._apply_theme()
         self._show_current()
         self._refocus_window()
@@ -2085,7 +2151,7 @@ class ReviewWindow(QMainWindow):
         self.progress.setdefault("decisions", {})
         self.progress.setdefault("clusters_completed", [])
         self.progress["source_file"] = path.name
-        save_progress(self.progress, self.results_path)
+        self._persist()
         self.cluster_index = self._first_incomplete_cluster_index()
         self.selected_product = ""
         self.setWindowTitle(f"Similarity Review — {path.name}")
@@ -2226,7 +2292,7 @@ class ReviewWindow(QMainWindow):
             "cluster_id": item["cluster_id"],
             "updated_at": utc_now(),
         }
-        save_progress(self.progress, self.results_path)
+        self._persist()
         self.queue_rail.update_status(product_number, status)
         self._refresh_top()
         next_pn = self._next_unreviewed_after(product_number)
@@ -2242,7 +2308,7 @@ class ReviewWindow(QMainWindow):
             return
         if product_number in self.progress["decisions"]:
             del self.progress["decisions"][product_number]
-            save_progress(self.progress, self.results_path)
+            self._persist()
         self.selected_product = product_number
         self.queue_rail.update_status(product_number, "unreviewed")
         self.queue_rail.set_selected(product_number)
@@ -2274,7 +2340,7 @@ class ReviewWindow(QMainWindow):
         completed = self.progress.setdefault("clusters_completed", [])
         if cid not in completed:
             completed.append(cid)
-            save_progress(self.progress, self.results_path)
+            self._persist()
 
     def _finish_cluster_and_next(self) -> None:
         if self._screen != "review":
