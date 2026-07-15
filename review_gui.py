@@ -5,11 +5,14 @@ Run:
     pip install -r requirements.txt
     python review_gui.py
 
-Up / Down           = previous / next match in the queue (arrow keys only)
 Left                = duplicate
 Right               = unique
-DISCARD / UNREVIEW  = use the on-screen buttons (no letter-key shortcuts)
-Enter               = Done -> next cluster
+Up                  = discard
+Down                = unreview
+Tab                 = next child (candidate in queue)
+Ctrl+Tab            = previous child
+Space               = next parent (next cluster)
+Ctrl+Space          = previous parent (previous cluster)
 O                   = open results workbook
 I                   = choose product input Excel and run similarity
                       (also prompted automatically on startup)
@@ -1191,8 +1194,8 @@ class TabStrip(QWidget):
             ("Dark", window._toggle_dark_mode),
             ("Results…", window._pick_results),
             ("Input…", window._pick_and_run_input),
-            ("◀ Prev", window._prev_cluster),
-            ("Done →", window._finish_cluster_and_next),
+            ("◀ Prev parent", window._prev_cluster),
+            ("Next parent →", window._finish_cluster_and_next),
         ):
             btn = QPushButton(text)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1649,10 +1652,10 @@ class DecisionBar(QWidget):
         self._layout.setSpacing(12)
         self._buttons: list[tuple[QPushButton, str]] = []
         specs = (
-            ("<-  DUPLICATE", "Left arrow", "coral", "duplicate"),
-            ("UNIQUE  ->", "Right arrow", "teal", "unique"),
-            ("DISCARD", "button", "ochre", "discard"),
-            ("UNREVIEW", "button", "muted", "unreviewed"),
+            ("<-  DUPLICATE", "Left", "coral", "duplicate"),
+            ("UNIQUE  ->", "Right", "teal", "unique"),
+            ("DISCARD", "Up", "ochre", "discard"),
+            ("UNREVIEW", "Down", "muted", "unreviewed"),
         )
         for title, hint, color_key, status in specs:
             btn = QPushButton(f"{title}\n{hint}")
@@ -1809,21 +1812,57 @@ class ReviewWindow(QMainWindow):
             sc.setContext(Qt.ShortcutContext.WindowShortcut)
             sc.activated.connect(slot)
 
-        # Marks and navigation: arrow keys only (no D/U/J/K letter shortcuts).
-        bind("Left", lambda: self._mark_focused("duplicate"))
-        bind("Right", lambda: self._mark_focused("unique"))
-        bind("Up", lambda: self._move_focus(-1))
-        bind("Down", lambda: self._move_focus(1))
-        bind("Return", self._finish_cluster_and_next)
-        bind("Enter", self._finish_cluster_and_next)
+        # Review navigation/marks are handled in keyPressEvent for reliable Tab/Space.
         bind("O", self._pick_results)
         bind("I", self._pick_and_run_input)
         bind("S", self.show_reports_screen)
         bind("R", self.show_reports_screen)
         bind("T", self._toggle_dark_mode)
         bind("Escape", self._toggle_fullscreen)
-        bind("Ctrl+Left", self._prev_cluster)
-        bind("Ctrl+Right", self._finish_cluster_and_next)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        """Primary review controls (arrows / Tab / Space)."""
+        if self._screen != "review":
+            super().keyPressEvent(event)
+            return
+
+        key = event.key()
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+
+        if key == Qt.Key.Key_Left:
+            self._mark_focused("duplicate")
+            event.accept()
+            return
+        if key == Qt.Key.Key_Right:
+            self._mark_focused("unique")
+            event.accept()
+            return
+        if key == Qt.Key.Key_Up:
+            self._mark_focused("discard")
+            event.accept()
+            return
+        if key == Qt.Key.Key_Down:
+            self._clear_focused()
+            event.accept()
+            return
+        if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+            # Tab = next child; Ctrl+Tab (and Backtab) = previous child
+            if ctrl or key == Qt.Key.Key_Backtab:
+                self._move_focus(-1)
+            else:
+                self._move_focus(1)
+            event.accept()
+            return
+        if key == Qt.Key.Key_Space:
+            if ctrl:
+                self._prev_cluster()
+            else:
+                self._finish_cluster_and_next()
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
 
     def _persist(self) -> None:
         """Save progress JSON + companion decisions Excel; never alter original results."""
@@ -2353,7 +2392,7 @@ class ReviewWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "All clusters done",
-                "That was the last cluster. Use ◀ Prev to go back if needed.",
+                "That was the last cluster. Use Ctrl+Space or Prev parent to go back if needed.",
             )
             return
         self.cluster_index += 1
