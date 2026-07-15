@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -347,6 +348,35 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def format_duration(seconds: float | int | None) -> str:
+    """Human-readable duration for timers and reports."""
+    if seconds is None:
+        return "—"
+    total = max(0, int(round(float(seconds))))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def parent_times_dict(progress: dict) -> dict[str, float]:
+    """Normalized cluster_id → cumulative seconds spent reviewing that parent."""
+    raw = progress.get("parent_times") or {}
+    out: dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            secs = float(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if secs <= 0:
+            continue
+        out[str(key)] = secs
+    return out
+
+
 def clean_text(value) -> str:
     if value is None:
         return ""
@@ -504,11 +534,13 @@ def load_progress(results_path: Path | None = None) -> dict:
             "source_file": results_path.name if results_path else "",
             "decisions": {},
             "clusters_completed": [],
+            "parent_times": {},
         }
     with path.open(encoding="utf-8") as f:
         data = json.load(f)
     data.setdefault("decisions", {})
     data.setdefault("clusters_completed", [])
+    data.setdefault("parent_times", {})
     if results_path is not None:
         data["source_file"] = results_path.name
     return data
@@ -617,6 +649,13 @@ def compute_review_stats(
             if pn in by_product and by_product[pn]["cluster_id"] == current_cluster_id
         )
 
+    times = parent_times_dict(progress)
+    timed_parents = len(times)
+    total_parent_seconds = sum(times.values())
+    avg_seconds_per_parent = (
+        total_parent_seconds / timed_parents if timed_parents else 0.0
+    )
+
     return {
         "total": total,
         "reviewed": reviewed,
@@ -638,6 +677,9 @@ def compute_review_stats(
         "current_cluster_index": current_cluster_index,
         "current_cluster_reviewed": current_cluster_reviewed,
         "current_cluster_size": current_cluster_size,
+        "timed_parents": timed_parents,
+        "total_parent_seconds": total_parent_seconds,
+        "avg_seconds_per_parent": avg_seconds_per_parent,
         "source_file": progress.get("source_file", ""),
         "updated_at": progress.get("updated_at", ""),
     }
@@ -661,6 +703,13 @@ def format_review_stats(stats: dict) -> str:
             f"(id {stats['current_cluster_id']}) — "
             f"{stats['current_cluster_reviewed']:,} / {stats['current_cluster_size']:,} marked",
         ])
+    lines.extend([
+        "",
+        "Time per parent",
+        f"  Parents timed {stats['timed_parents']:,}",
+        f"  Total time    {format_duration(stats['total_parent_seconds'])}",
+        f"  Average       {format_duration(stats['avg_seconds_per_parent'])} per parent",
+    ])
     lines.extend([
         "",
         "Decisions (reviewed items only)",
@@ -719,6 +768,7 @@ def build_cluster_report_rows(
 ) -> list[dict]:
     decisions = progress.get("decisions", {})
     completed = set(progress.get("clusters_completed", []))
+    times = parent_times_dict(progress)
     rows: list[dict] = []
     for cid in cluster_order:
         items = clusters.get(cid, [])
@@ -730,6 +780,7 @@ def build_cluster_report_rows(
         marked = sum(counts.values())
         size = len(items)
         root = cluster_root(items)
+        seconds = times.get(str(cid), 0.0)
         rows.append({
             "cluster_id": cid,
             "size": size,
@@ -740,6 +791,8 @@ def build_cluster_report_rows(
             "discard": counts["discard"],
             "completed": cid in completed,
             "reference": root["product_number"] if root else "",
+            "time_seconds": seconds,
+            "time_label": format_duration(seconds) if seconds else "—",
         })
     return rows
 
@@ -780,6 +833,10 @@ def export_management_report(
             ["Clusters total", stats["n_clusters"]],
             ["Clusters completed", stats["n_clusters_done"]],
             ["Clusters completed %", round(stats["clusters_done_pct"], 1)],
+            ["Parents with time recorded", stats["timed_parents"]],
+            ["Total time on parents", format_duration(stats["total_parent_seconds"])],
+            ["Average time per parent", format_duration(stats["avg_seconds_per_parent"])],
+            ["Average time per parent (seconds)", round(stats["avg_seconds_per_parent"], 1)],
             ["Marked duplicate", stats["duplicate"]],
             ["Marked unique", stats["unique"]],
             ["Marked discard", stats["discard"]],
@@ -814,11 +871,15 @@ def export_management_report(
 
     write_sheet(
         "Cluster Progress",
-        ["Cluster", "Reference", "Size", "Marked", "Remaining", "Duplicate", "Unique", "Discard", "Completed"],
+        [
+            "Cluster", "Reference", "Size", "Marked", "Remaining",
+            "Duplicate", "Unique", "Discard", "Completed", "Time", "Time (seconds)",
+        ],
         [
             [
                 r["cluster_id"], r["reference"], r["size"], r["marked"], r["remaining"],
                 r["duplicate"], r["unique"], r["discard"], r["completed"],
+                r["time_label"], round(r["time_seconds"], 1),
             ]
             for r in cluster_rows
         ],
@@ -906,9 +967,9 @@ class ReportsScreen(QWidget):
         self.cluster_caption = QLabel("Cluster progress")
         self.cluster_caption.setFont(pick_font(FONT_TITLE, "Segoe UI", 11, QFont.Weight.Bold))
         right.addWidget(self.cluster_caption)
-        self.cluster_table = QTableWidget(0, 7)
+        self.cluster_table = QTableWidget(0, 8)
         self.cluster_table.setHorizontalHeaderLabels(
-            ["Cluster", "Reference", "Size", "Marked", "Dup", "Unique", "Done"],
+            ["Cluster", "Reference", "Size", "Marked", "Dup", "Unique", "Done", "Time"],
         )
         self.cluster_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.cluster_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -992,7 +1053,8 @@ class ReportsScreen(QWidget):
             f"Reviewed\n{s['reviewed']:,} / {s['total']:,}\n{s['reviewed_pct']:.1f}%",
             f"Duplicates\n{s['duplicate']:,}\n{s['duplicate_pct_of_total']:.1f}% of all",
             f"Unique\n{s['unique']:,}\n{s['unique_pct_of_reviewed']:.1f}% of reviewed",
-            f"Clusters done\n{s['n_clusters_done']:,} / {s['n_clusters']:,}\n{s['clusters_done_pct']:.1f}%",
+            f"Avg / parent\n{format_duration(s['avg_seconds_per_parent'])}\n"
+            f"{s['timed_parents']:,} timed · {format_duration(s['total_parent_seconds'])} total",
         ]
         for lab, text in zip(self.kpi_labels, kpi_texts):
             lab.setText(text)
@@ -1021,6 +1083,7 @@ class ReportsScreen(QWidget):
                 str(row["duplicate"]),
                 str(row["unique"]),
                 "Yes" if row["completed"] else "No",
+                row["time_label"],
             ]
             for j, val in enumerate(values):
                 self.cluster_table.setItem(i, j, QTableWidgetItem(val))
@@ -1726,6 +1789,8 @@ class ReviewWindow(QMainWindow):
         self._reference_pn = ""
         self._candidate_order: list[str] = []
         self._screen = "review"
+        self._timer_cluster_id: int | None = None
+        self._timer_started_at: float | None = None
 
         shell = HatchPaper()
         root = QVBoxLayout(shell)
@@ -1780,6 +1845,10 @@ class ReviewWindow(QMainWindow):
         self.setCentralWidget(shell)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._install_shortcuts()
+        self._ui_clock = QTimer(self)
+        self._ui_clock.setInterval(1000)
+        self._ui_clock.timeout.connect(self._on_parent_clock_tick)
+        self._ui_clock.start()
         dark = bool(self.progress.get("dark_mode", False))
         apply_theme_palette(dark=dark)
         _sync_legacy_color_aliases()
@@ -1794,17 +1863,24 @@ class ReviewWindow(QMainWindow):
     def show_review_screen(self) -> None:
         self._screen = "review"
         self.stack.setCurrentIndex(0)
+        self._resume_parent_timer()
+        self._refresh_top()
         self.top_strip.apply_theme()
         self.tab_strip.apply_theme()
         self._refocus_window()
 
     def show_reports_screen(self) -> None:
+        self._pause_parent_timer(persist=True)
         self._screen = "reports"
         self.reports_screen.refresh()
         self.stack.setCurrentIndex(1)
         self.top_strip.apply_theme()
         self.tab_strip.apply_theme()
         self._refocus_window()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._pause_parent_timer(persist=True)
+        super().closeEvent(event)
 
     def _install_shortcuts(self) -> None:
         def bind(key: str, slot) -> None:
@@ -1884,6 +1960,61 @@ class ReviewWindow(QMainWindow):
         except OSError:
             # Excel lock / permission — JSON is already safe; ignore companion write.
             pass
+
+    def _on_parent_clock_tick(self) -> None:
+        if self._screen == "review" and self._timer_started_at is not None:
+            self._refresh_top()
+
+    def _accumulated_parent_seconds(self, cid: int | None) -> float:
+        if cid is None:
+            return 0.0
+        times = self.progress.setdefault("parent_times", {})
+        key = str(cid)
+        try:
+            return float(times.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _live_parent_seconds(self, cid: int | None = None) -> float:
+        if cid is None:
+            cid = self._timer_cluster_id
+        seconds = self._accumulated_parent_seconds(cid)
+        if (
+            cid is not None
+            and self._timer_cluster_id == cid
+            and self._timer_started_at is not None
+        ):
+            seconds += max(0.0, time.monotonic() - self._timer_started_at)
+        return seconds
+
+    def _pause_parent_timer(self, *, persist: bool = True) -> None:
+        if self._timer_cluster_id is None or self._timer_started_at is None:
+            self._timer_started_at = None
+            return
+        elapsed = max(0.0, time.monotonic() - self._timer_started_at)
+        times = self.progress.setdefault("parent_times", {})
+        key = str(self._timer_cluster_id)
+        try:
+            prior = float(times.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            prior = 0.0
+        times[key] = prior + elapsed
+        self._timer_started_at = None
+        self._timer_cluster_id = None
+        if persist:
+            self._persist()
+
+    def _resume_parent_timer(self, cid: int | None = None) -> None:
+        if cid is None:
+            cid = self._current_cluster_id()
+        if cid is None or self._screen != "review":
+            return
+        if self._timer_cluster_id == cid and self._timer_started_at is not None:
+            return
+        if self._timer_started_at is not None:
+            self._pause_parent_timer(persist=True)
+        self._timer_cluster_id = cid
+        self._timer_started_at = time.monotonic()
 
     def _refocus_window(self) -> None:
         self.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -2187,16 +2318,24 @@ class ReviewWindow(QMainWindow):
         if not path.exists():
             QMessageBox.critical(self, "Missing file", f"Could not find:\n{path}")
             return
+
+        # Flush time onto the previous workbook before swapping data/progress.
+        self._pause_parent_timer(persist=True)
+
         try:
-            self.cluster_order, self.clusters, self.by_product = load_grouped_review(path)
+            cluster_order, clusters, by_product = load_grouped_review(path)
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", f"Could not read Grouped Review sheet:\n{exc}")
             return
 
+        self.cluster_order = cluster_order
+        self.clusters = clusters
+        self.by_product = by_product
         self.results_path = path
         self.progress = load_progress(path)
         self.progress.setdefault("decisions", {})
         self.progress.setdefault("clusters_completed", [])
+        self.progress.setdefault("parent_times", {})
         self.progress["source_file"] = path.name
         self._persist()
         self.cluster_index = self._first_incomplete_cluster_index()
@@ -2235,14 +2374,21 @@ class ReviewWindow(QMainWindow):
         done = cid in self.progress.get("clusters_completed", [])
         status = "DONE" if done else "in progress"
         marked_cands = sum(1 for pn in self._candidate_order if pn in self.progress["decisions"])
+        parent_time = format_duration(self._live_parent_seconds(cid))
         self.top_strip.set_info(
             f"{self.results_path.name}  ·  Cluster {self.cluster_index + 1} / {len(self.cluster_order)}  ·  id {cid}  ·  {status}",
             f"{reviewed}/{len(items)} marked  ·  queue {marked_cands}/{len(self._candidate_order)}  ·  "
-            f"all {len(self.progress['decisions']):,}/{len(self.by_product):,}",
+            f"all {len(self.progress['decisions']):,}/{len(self.by_product):,}  ·  "
+            f"parent {parent_time}",
         )
 
     def _render_cluster(self) -> None:
         cid = self._current_cluster_id()
+        if self._timer_cluster_id is not None and self._timer_cluster_id != cid:
+            self._pause_parent_timer(persist=True)
+        if self._screen == "review" and cid is not None:
+            self._resume_parent_timer(cid)
+
         self._candidate_order = []
         self._reference_pn = ""
 
