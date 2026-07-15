@@ -257,7 +257,11 @@ Notes
 Set-Content -Path (Join-Path $pkgRoot "README_for_manager.txt") -Value $readme -Encoding ASCII
 
 Write-Host "==> Creating zip (portable fallback)..."
-Compress-Archive -Path $pkgRoot -DestinationPath $zipPath -Force
+try {
+  Compress-Archive -Path $pkgRoot -DestinationPath $zipPath -Force
+} catch {
+  Write-Host "WARNING: zip failed ($_). Continuing with installer build…"
+}
 
 Write-Host "==> Building Windows installer (Inno Setup)..."
 $iscc = Find-ISCC
@@ -267,7 +271,9 @@ if (-not $iscc) {
   Write-Host "  1. Install Inno Setup 6 from https://jrsoftware.org/isinfo.php"
   Write-Host "  2. Re-run: powershell -ExecutionPolicy Bypass -File .\build_package.ps1"
   Write-Host ""
-  Write-Host "Portable zip was still created: $zipPath"
+  if (Test-Path $zipPath) {
+    Write-Host "Portable zip was still created: $zipPath"
+  }
   throw "Inno Setup not installed (ISCC.exe missing)"
 }
 
@@ -280,6 +286,10 @@ if (-not (Test-Path $setupPath)) {
 Write-Host ""
 Write-Host "Done."
 Write-Host "  Package folder: $pkgRoot"
-Write-Host "  Zip (fallback): $zipPath"
+if (Test-Path $zipPath) {
+  Write-Host "  Zip (fallback): $zipPath"
+} else {
+  Write-Host "  Zip (fallback): (not created)"
+}
 Write-Host "  Installer:      $setupPath"
 Write-Host "  Send managers:  $setupPath"
