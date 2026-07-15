@@ -1821,7 +1821,7 @@ class ReviewWindow(QMainWindow):
         bind("Escape", self._toggle_fullscreen)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
-        """Primary review controls (arrows / Tab / Space)."""
+        """Primary review controls (arrows / Ctrl+Tab / Space)."""
         if self._screen != "review":
             super().keyPressEvent(event)
             return
@@ -1846,12 +1846,13 @@ class ReviewWindow(QMainWindow):
             self._clear_focused()
             event.accept()
             return
-        if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
-            # Tab = next child; Ctrl+Tab (and Backtab) = previous child
-            if ctrl or key == Qt.Key.Key_Backtab:
-                self._move_focus(-1)
-            else:
-                self._move_focus(1)
+        # Plain Tab is handled in focusNextPrevChild (Qt steals it for focus walking).
+        if key == Qt.Key.Key_Tab and ctrl:
+            self._move_focus(-1)
+            event.accept()
+            return
+        if key == Qt.Key.Key_Backtab:
+            self._move_focus(-1)
             event.accept()
             return
         if key == Qt.Key.Key_Space:
@@ -1863,6 +1864,13 @@ class ReviewWindow(QMainWindow):
             return
 
         super().keyPressEvent(event)
+
+    def focusNextPrevChild(self, next: bool) -> bool:  # noqa: A003, N802
+        """Tab / Shift+Tab → next / previous child in the review queue."""
+        if self._screen == "review":
+            self._move_focus(1 if next else -1)
+            return True
+        return super().focusNextPrevChild(next)
 
     def _persist(self) -> None:
         """Save progress JSON + companion decisions Excel; never alter original results."""
