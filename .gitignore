@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Local / personal data
+review_progress*.json
+review_boot.log
+review_crash.log
+*.xlsx
+!requirements.txt
+
+# PyInstaller / package build outputs (rebuild with build_package.ps1)
+dist/
+build/
+*.spec
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
