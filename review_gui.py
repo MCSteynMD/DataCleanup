@@ -35,7 +35,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -1847,6 +1847,11 @@ class ReviewWindow(QMainWindow):
         self.setCentralWidget(shell)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._install_shortcuts()
+        # Route review keys at the application level so arrows/Tab/Space work no
+        # matter which child widget (e.g. the scroll area) currently holds focus.
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self._ui_clock = QTimer(self)
         self._ui_clock.setInterval(1000)
         self._ui_clock.timeout.connect(self._on_parent_clock_tick)
@@ -1898,49 +1903,59 @@ class ReviewWindow(QMainWindow):
         bind("T", self._toggle_dark_mode)
         bind("Escape", self._toggle_fullscreen)
 
-    def keyPressEvent(self, event) -> None:  # noqa: N802
-        """Primary review controls (arrows / Ctrl+Tab / Space)."""
+    def _review_keys_active(self) -> bool:
+        """Only capture review keys when the review screen is truly interactive."""
         if self._screen != "review":
-            super().keyPressEvent(event)
-            return
+            return False
+        if not self.isActiveWindow():
+            return False
+        # Never steal keys from a modal dialog (file/progress/message boxes).
+        return QApplication.activeModalWidget() is None
 
+    def _handle_review_key(self, event) -> bool:
+        """Apply an arrow/Tab/Space review control. Returns True if consumed."""
         key = event.key()
-        mods = event.modifiers()
-        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
 
         if key == Qt.Key.Key_Left:
             self._mark_focused("duplicate")
-            event.accept()
-            return
+            return True
         if key == Qt.Key.Key_Right:
             self._mark_focused("unique")
-            event.accept()
-            return
+            return True
         if key == Qt.Key.Key_Up:
             self._mark_focused("discard")
-            event.accept()
-            return
+            return True
         if key == Qt.Key.Key_Down:
             self._clear_focused()
-            event.accept()
-            return
-        # Plain Tab is handled in focusNextPrevChild (Qt steals it for focus walking).
-        if key == Qt.Key.Key_Tab and ctrl:
-            self._move_focus(-1)
-            event.accept()
-            return
+            return True
+        if key == Qt.Key.Key_Tab:
+            self._move_focus(-1 if ctrl else 1)
+            return True
         if key == Qt.Key.Key_Backtab:
             self._move_focus(-1)
-            event.accept()
-            return
+            return True
         if key == Qt.Key.Key_Space:
             if ctrl:
                 self._prev_cluster()
             else:
                 self._finish_cluster_and_next()
+            return True
+        return False
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        """Catch review controls before focused children (e.g. scroll area) eat them."""
+        if event.type() == QEvent.Type.KeyPress and self._review_keys_active():
+            if self._handle_review_key(event):
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        """Fallback review controls (arrows / Tab / Space)."""
+        if self._screen == "review" and self._handle_review_key(event):
             event.accept()
             return
-
         super().keyPressEvent(event)
 
     def focusNextPrevChild(self, next: bool) -> bool:  # noqa: A003, N802
