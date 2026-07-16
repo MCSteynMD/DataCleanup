@@ -1542,8 +1542,8 @@ class MergedDiffHero(QWidget):
     def __init__(self) -> None:
         super().__init__()
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 20, 28, 16)
-        outer.setSpacing(14)
+        outer.setContentsMargins(24, 16, 28, 12)
+        outer.setSpacing(6)
 
         self.ref_caption = QLabel("REFERENCE")
         self.ref_caption.setFont(pick_font(FONT_TITLE, "Segoe UI", 11, QFont.Weight.Bold))
@@ -1557,8 +1557,30 @@ class MergedDiffHero(QWidget):
         self.ref_desc = QLabel("")
         self.ref_desc.setFont(pick_font(FONT_TITLE, "Segoe UI", 15))
         self.ref_desc.setWordWrap(True)
-        self.ref_desc.setMinimumHeight(72)
+        self.ref_desc.setMinimumHeight(44)
         outer.addWidget(self.ref_desc)
+
+        # Matched items (candidate tokens) sit directly under the reference
+        # they were matched with; the candidate identity/score follows below.
+        self.legend = QLabel(
+            "shared  ·  drawing match xx-xx-xx (yellow)  ·  added (teal)  ·  missing (red)",
+        )
+        self.legend.setFont(pick_font(FONT_TITLE, "Segoe UI", 9))
+        outer.addWidget(self.legend)
+
+        self.stream_label = QLabel("CANDIDATE TOKENS")
+        self.stream_label.setFont(pick_font(FONT_TITLE, "Segoe UI", 8, QFont.Weight.Bold))
+        outer.addWidget(self.stream_label)
+
+        self.cand_flow = TokenChipFlow()
+        outer.addWidget(self.cand_flow)
+
+        self.miss_label = QLabel("ONLY IN REFERENCE")
+        self.miss_label.setFont(pick_font(FONT_TITLE, "Segoe UI", 8, QFont.Weight.Bold))
+        outer.addWidget(self.miss_label)
+
+        self.miss_flow = TokenChipFlow()
+        outer.addWidget(self.miss_flow)
 
         self.rule = QFrame()
         self.rule.setFixedHeight(3)
@@ -1589,26 +1611,6 @@ class MergedDiffHero(QWidget):
         self.meter = ScoreMeter()
         score_row.addWidget(self.meter, 1)
         outer.addLayout(score_row)
-
-        self.legend = QLabel(
-            "shared  ·  drawing match xx-xx-xx (yellow)  ·  added (teal)  ·  missing (red)",
-        )
-        self.legend.setFont(pick_font(FONT_TITLE, "Segoe UI", 9))
-        outer.addWidget(self.legend)
-
-        self.stream_label = QLabel("CANDIDATE TOKENS")
-        self.stream_label.setFont(pick_font(FONT_TITLE, "Segoe UI", 8, QFont.Weight.Bold))
-        outer.addWidget(self.stream_label)
-
-        self.cand_flow = TokenChipFlow()
-        outer.addWidget(self.cand_flow)
-
-        self.miss_label = QLabel("ONLY IN REFERENCE")
-        self.miss_label.setFont(pick_font(FONT_TITLE, "Segoe UI", 8, QFont.Weight.Bold))
-        outer.addWidget(self.miss_label)
-
-        self.miss_flow = TokenChipFlow()
-        outer.addWidget(self.miss_flow)
 
         outer.addStretch(1)
         self.apply_theme()
