@@ -79,6 +79,20 @@ EMIT_ALL_PAIRS_SHEET = False  # full pair dump — use Review Pairs instead
 # Jaccard scores much. 0.0 = keep every token. If the run is too slow, try 0.5.
 MAX_DOC_FREQUENCY = 0.0
 
+# Semantic "possible related" suggestions ------------------------------------
+# A sentence-transformers model embeds every description and finds near
+# neighbours that landed in a DIFFERENT cluster. These never change the strict
+# Jaccard clusters; they are written to a "Semantic Suggestions" sheet and shown
+# in the reviewer as click-to-jump hints so a human can catch vague synonym
+# cases (e.g. "ZIP TIE" vs "CABLE TIE") the lexical matcher misses.
+SEMANTIC_ENABLED = True
+# Path to a bundled model folder (offline). Absolute, or relative to this file
+# / the PyInstaller bundle. Pre-download all-MiniLM-L6-v2 into models/.
+SEMANTIC_MODEL_PATH = "models/all-MiniLM-L6-v2"
+SEMANTIC_THRESHOLD = 0.55   # cosine 0..1; higher = stricter / fewer suggestions
+SEMANTIC_TOP_K = 5          # max cross-cluster suggestions kept per product
+SEMANTIC_BATCH_SIZE = 256   # embedding batch size
+
 # =============================================================================
 
 
@@ -417,6 +431,154 @@ def build_grouped_review_df(
     if not rows:
         return pd.DataFrame(columns=columns)
     return pd.DataFrame(rows)[columns]
+
+
+SEMANTIC_COLUMNS = [
+    "product_number", "product_cluster_id",
+    "suggested_product", "suggested_cluster_id",
+    "suggested_description", "semantic_score",
+]
+
+
+def _resolve_semantic_model_path() -> str | None:
+    """Locate the bundled sentence-transformers model without hitting the network."""
+    if not SEMANTIC_MODEL_PATH:
+        return None
+    configured = Path(SEMANTIC_MODEL_PATH)
+    if configured.is_absolute():
+        return str(configured) if configured.exists() else None
+    bases = [
+        Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "frozen", False) else None,
+        Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None,
+        Path(__file__).resolve().parent,
+    ]
+    for base in bases:
+        if base is None:
+            continue
+        candidate = base / configured
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def build_semantic_suggestions_df(
+    products: list[str],
+    descriptions: list[str],
+    cluster_ids: list[int],
+) -> pd.DataFrame:
+    """Cross-cluster nearest-neighbour suggestions via sentence embeddings.
+
+    Returns rows of (product, its cluster, suggested product, suggested cluster,
+    suggested description, cosine score). Suggestions are review-only hints and
+    never affect the strict Jaccard clusters. Any failure degrades to empty.
+    """
+    n = len(products)
+    if n < 2:
+        return pd.DataFrame(columns=SEMANTIC_COLUMNS)
+
+    import os
+
+    # Never reach out to Hugging Face at runtime — the model is bundled.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    try:
+        import numpy as np
+        from sentence_transformers import SentenceTransformer
+    except Exception as exc:  # noqa: BLE001 - optional dependency / build
+        print(f"  Semantic pass skipped (import failed): {exc}")
+        return pd.DataFrame(columns=SEMANTIC_COLUMNS)
+
+    model_path = _resolve_semantic_model_path()
+    if model_path is None:
+        print(f"  Semantic pass skipped: model not found at {SEMANTIC_MODEL_PATH!r}")
+        return pd.DataFrame(columns=SEMANTIC_COLUMNS)
+
+    try:
+        model = SentenceTransformer(model_path, device="cpu")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Semantic pass skipped (model load failed): {exc}")
+        return pd.DataFrame(columns=SEMANTIC_COLUMNS)
+
+    # Collapse identical (case-folded) descriptions so each is embedded once.
+    uniq_index: dict[str, int] = {}
+    uniq_texts: list[str] = []
+    uniq_rows: list[list[int]] = []
+    for i, desc in enumerate(descriptions):
+        key = (desc or "").strip().lower()
+        u = uniq_index.get(key)
+        if u is None:
+            u = len(uniq_texts)
+            uniq_index[key] = u
+            uniq_texts.append(desc or "")
+            uniq_rows.append([])
+        uniq_rows[u].append(i)
+    m = len(uniq_texts)
+
+    print(f"Semantic pass: embedding {m:,} unique descriptions (model on CPU) ...")
+    try:
+        emb = model.encode(
+            uniq_texts,
+            batch_size=int(SEMANTIC_BATCH_SIZE),
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).astype(np.float32)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Semantic pass skipped (encode failed): {exc}")
+        return pd.DataFrame(columns=SEMANTIC_COLUMNS)
+
+    thr = float(SEMANTIC_THRESHOLD)
+    k = int(SEMANTIC_TOP_K)
+    # Pull a few extra neighbours before the cross-cluster filter trims them.
+    kbuf = min(m - 1, max(k * 4, k + 8))
+    block = 512
+    rows: list[dict] = []
+
+    for start in range(0, m, block):
+        stop = min(start + block, m)
+        sims = emb[start:stop] @ emb.T  # (b, m), values in [-1, 1]
+        for bi in range(stop - start):
+            ui = start + bi
+            row = sims[bi]
+            row[ui] = -1.0  # never suggest self
+            part = np.argpartition(row, -kbuf)[-kbuf:]
+            part = part[np.argsort(row[part])[::-1]]
+            neighbours: list[tuple[int, float]] = []
+            for uj in part:
+                score = float(row[uj])
+                if score < thr:
+                    break
+                neighbours.append((int(uj), score))
+            if not neighbours:
+                continue
+            for i in uniq_rows[ui]:
+                ci = cluster_ids[i]
+                kept = 0
+                for uj, score in neighbours:
+                    rep = next(
+                        (j for j in uniq_rows[uj] if cluster_ids[j] != ci),
+                        None,
+                    )
+                    if rep is None:
+                        continue
+                    rows.append({
+                        "product_number": products[i],
+                        "product_cluster_id": ci,
+                        "suggested_product": products[rep],
+                        "suggested_cluster_id": cluster_ids[rep],
+                        "suggested_description": descriptions[rep],
+                        "semantic_score": round(score, 4),
+                    })
+                    kept += 1
+                    if kept >= k:
+                        break
+        done = min(stop, m)
+        print(f"  semantic neighbours {done:,} / {m:,} unique")
+
+    if not rows:
+        return pd.DataFrame(columns=SEMANTIC_COLUMNS)
+    return pd.DataFrame(rows)[SEMANTIC_COLUMNS]
 
 
 def build_needs_review_df(
@@ -1007,6 +1169,16 @@ def main(argv: list[str] | None = None) -> int:
         dup_group_by_row,
     )
 
+    semantic_df: pd.DataFrame | None = None
+    if SEMANTIC_ENABLED:
+        try:
+            semantic_df = build_semantic_suggestions_df(
+                products, descriptions, cluster_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 - never fail the run over hints
+            print(f"  Semantic pass failed: {exc}")
+            semantic_df = None
+
     review_pairs_df = None
     needs_review_df = None
     cluster_df = None
@@ -1108,6 +1280,8 @@ def main(argv: list[str] | None = None) -> int:
         summary_df.to_excel(xl, sheet_name="Summary", index=False)
         grouped_review_df.to_excel(xl, sheet_name="Grouped Review", index=False)
         dup_df.to_excel(xl, sheet_name="Exact Duplicates", index=False)
+        if semantic_df is not None:
+            semantic_df.to_excel(xl, sheet_name="Semantic Suggestions", index=False)
         if not gui_mode:
             review_pairs_df.to_excel(xl, sheet_name="Review Pairs", index=False)
             needs_review_df.to_excel(xl, sheet_name="Needs Review", index=False)
@@ -1143,6 +1317,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Rows in such clusters         : {rows_in_multi:,}")
     print(f"  Exact-duplicate groups        : {n_dup_groups:,}")
     print(f"  Rows in exact-duplicate groups: {rows_in_dups:,}")
+    if semantic_df is not None:
+        print(f"  Semantic suggestion rows      : {len(semantic_df):,}")
     return 0
 
 

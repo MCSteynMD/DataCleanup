@@ -18,6 +18,8 @@ I                   = choose product input Excel and run similarity
                       (also prompted automatically on startup)
 S / R               = Reports screen (export for superiors)
 T                   = toggle dark mode
+Ctrl+F              = jump to a parent (cluster reference) code
+G                   = show/hide the Related (semantic) suggestions panel
 
 Progress is saved in separate sidecar files next to the results workbook
 (never modifies the original similarity_results*.xlsx):
@@ -52,6 +54,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -213,6 +216,9 @@ def access_denied_help(engine: Path | None = None) -> str:
 
 FONT_TITLE = "Bahnschrift"
 FONT_MONO = "Cascadia Mono"
+
+# Max semantic "possible related" items shown per cluster in the reviewer panel.
+SEMANTIC_MAX_PER_CLUSTER = 12
 
 STATUS_LABELS = {
     "duplicate": "Duplicate",
@@ -507,6 +513,60 @@ def load_grouped_review(path: Path) -> tuple[list[int], dict[int, list[dict]], d
         wb.close()
 
     return cluster_order, clusters, by_product
+
+
+def load_semantic_suggestions(path: Path) -> dict[str, list[dict]]:
+    """Read the optional 'Semantic Suggestions' sheet.
+
+    Returns product_number -> list of suggestion dicts (sorted by score desc).
+    Missing sheet or any read error yields an empty mapping so older workbooks
+    still open cleanly.
+    """
+    from openpyxl import load_workbook
+
+    out: dict[str, list[dict]] = {}
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return out
+    try:
+        if "Semantic Suggestions" not in wb.sheetnames:
+            return out
+        ws = wb["Semantic Suggestions"]
+        rows_iter = ws.iter_rows(values_only=True)
+        header_row = next(rows_iter, None)
+        if not header_row:
+            return out
+        col = {clean_text(h): i for i, h in enumerate(header_row)}
+        required = ("product_number", "suggested_product")
+        if any(name not in col for name in required):
+            return out
+
+        def cell(row, name):
+            idx = col.get(name)
+            if idx is None or idx >= len(row):
+                return None
+            return row[idx]
+
+        for row in rows_iter:
+            if row is None or all(v is None or v == "" for v in row):
+                continue
+            pn = clean_text(cell(row, "product_number"))
+            suggested = clean_text(cell(row, "suggested_product"))
+            if not pn or not suggested:
+                continue
+            out.setdefault(pn, []).append({
+                "suggested_product": suggested,
+                "suggested_cluster_id": _safe_int(cell(row, "suggested_cluster_id")),
+                "suggested_description": clean_description(cell(row, "suggested_description")),
+                "semantic_score": cell(row, "semantic_score"),
+            })
+    finally:
+        wb.close()
+
+    for pn in out:
+        out[pn].sort(key=lambda s: score_value(s["semantic_score"]), reverse=True)
+    return out
 
 
 def progress_path_for(results_path: Path) -> Path:
@@ -1255,6 +1315,7 @@ class TabStrip(QWidget):
 
         for text, slot in (
             ("Dark", window._toggle_dark_mode),
+            ("Related", window._toggle_related_panel),
             ("Results…", window._pick_results),
             ("Input…", window._pick_and_run_input),
             ("◀ Prev parent", window._prev_cluster),
@@ -1268,10 +1329,31 @@ class TabStrip(QWidget):
             self._action_buttons.append(btn)
 
         layout.addStretch(1)
+
+        self.search_field = QLineEdit()
+        self.search_field.setPlaceholderText("Go to parent code…")
+        self.search_field.setClearButtonEnabled(True)
+        self.search_field.setFixedWidth(190)
+        self.search_field.returnPressed.connect(self._on_search)
+        layout.addWidget(self.search_field)
+
+        self.search_btn = QPushButton("Go")
+        self.search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.search_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.search_btn.clicked.connect(self._on_search)
+        layout.addWidget(self.search_btn)
+
         self.review_btn = self._tab_buttons[0]
         self.reports_btn = self._tab_buttons[1]
         self.dark_btn = self._action_buttons[0]
         self.apply_theme()
+
+    def _on_search(self) -> None:
+        self._window._search_parent(self.search_field.text())
+
+    def focus_search(self) -> None:
+        self.search_field.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search_field.selectAll()
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -1311,6 +1393,21 @@ class TabStrip(QWidget):
         """
         for btn in self._tab_buttons + self._action_buttons:
             btn.setStyleSheet(btn_css)
+        self.search_btn.setStyleSheet(btn_css)
+        self.search_field.setStyleSheet(f"""
+            QLineEdit {{
+                background: {Theme.surface.name()};
+                color: {Theme.ink.name()};
+                border: 1px solid {Theme.rail_line.name()};
+                border-radius: 2px;
+                padding: 6px 8px;
+                font-family: {FONT_MONO};
+                font-size: 10pt;
+            }}
+            QLineEdit:focus {{
+                border-color: {Theme.accent.name()};
+            }}
+        """)
         if getattr(self._window, "_screen", "review") == "reports":
             self.reports_btn.setStyleSheet(active_css)
         else:
@@ -1777,6 +1874,117 @@ class DecisionBar(QWidget):
         super().paintEvent(event)
 
 
+class RelatedPanel(QWidget):
+    """Right-side list of cross-cluster semantic suggestions for the current cluster.
+
+    Purely mouse-driven (all widgets NoFocus) so it never interferes with the
+    arrow-key review shortcuts. Clicking a row jumps to that product's cluster.
+    """
+
+    PANEL_W = 290
+
+    def __init__(self, window: "ReviewWindow") -> None:
+        super().__init__()
+        self._window = window
+        self.setFixedWidth(self.PANEL_W)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 12, 12, 12)
+        outer.setSpacing(8)
+
+        self.caption = QLabel("RELATED (SEMANTIC)")
+        self.caption.setFont(pick_font(FONT_TITLE, "Segoe UI", 10, QFont.Weight.Bold))
+        outer.addWidget(self.caption)
+
+        self.hint = QLabel("")
+        self.hint.setFont(pick_font(FONT_TITLE, "Segoe UI", 9))
+        self.hint.setWordWrap(True)
+        outer.addWidget(self.hint)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list_host = QWidget()
+        self._list_layout = QVBoxLayout(self._list_host)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setSpacing(6)
+        self._list_layout.addStretch(1)
+        self.scroll.setWidget(self._list_host)
+        outer.addWidget(self.scroll, 1)
+
+        self._buttons: list[QPushButton] = []
+        self.apply_theme()
+
+    def _clear(self) -> None:
+        for btn in self._buttons:
+            btn.setParent(None)
+            btn.deleteLater()
+        self._buttons = []
+
+    def set_items(self, items: list[dict]) -> None:
+        self._clear()
+        if not items:
+            self.hint.setText("No related items for this parent.")
+        else:
+            self.hint.setText(
+                f"{len(items)} possible related item(s) in other clusters — click to jump."
+            )
+        insert_at = self._list_layout.count() - 1  # keep the trailing stretch last
+        for it in items:
+            pn = it.get("suggested_product", "")
+            score = format_score(it.get("semantic_score"))
+            desc = (it.get("suggested_description") or "").strip()
+            short = desc if len(desc) <= 70 else desc[:69] + "…"
+            btn = QPushButton(f"{pn}   ·   {score}\n{short or '(no description)'}")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setMinimumHeight(46)
+            btn.setToolTip(f"{pn}\n{desc}")
+            btn.clicked.connect(lambda _=False, p=pn: self._window._search_parent(p))
+            self._list_layout.insertWidget(insert_at, btn)
+            self._buttons.append(btn)
+            insert_at += 1
+        self._style_buttons()
+
+    def _style_buttons(self) -> None:
+        css = f"""
+            QPushButton {{
+                background: {Theme.surface.name()};
+                color: {Theme.ink.name()};
+                border: 1px solid {Theme.paper_deep.name()};
+                border-left: 3px solid {Theme.teal.name()};
+                border-radius: 2px;
+                padding: 8px 10px;
+                text-align: left;
+                font-family: {FONT_MONO};
+                font-size: 9pt;
+            }}
+            QPushButton:hover {{
+                border-color: {Theme.accent.name()};
+                background: {Theme.hover_tint};
+            }}
+        """
+        for btn in self._buttons:
+            btn.setStyleSheet(css)
+
+    def apply_theme(self) -> None:
+        self.caption.setStyleSheet(f"color: {Theme.ink.name()}; letter-spacing: 1px;")
+        self.hint.setStyleSheet(f"color: {Theme.ink_muted.name()};")
+        self.scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self._list_host.setStyleSheet("background: transparent;")
+        self._style_buttons()
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Theme.paper_deep)
+        painter.setPen(QPen(Theme.rail_line, 1))
+        painter.drawLine(0, 0, 0, self.height())
+
+
 class ReviewWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1785,6 +1993,7 @@ class ReviewWindow(QMainWindow):
         self.cluster_order: list[int] = []
         self.clusters: dict[int, list[dict]] = {}
         self.by_product: dict[str, dict] = {}
+        self.semantic_suggestions: dict[str, list[dict]] = {}
         self.progress = load_progress(self.results_path)
         self.cluster_index = 0
         self.selected_product = ""
@@ -1830,6 +2039,9 @@ class ReviewWindow(QMainWindow):
         self.hero.setStyleSheet("background: transparent;")
         scroll.setWidget(self.hero)
         body.addWidget(scroll, 1)
+
+        self.related_panel = RelatedPanel(self)
+        body.addWidget(self.related_panel)
 
         body_wrap = QWidget()
         body_wrap.setLayout(body)
@@ -1901,6 +2113,8 @@ class ReviewWindow(QMainWindow):
         bind("S", self.show_reports_screen)
         bind("R", self.show_reports_screen)
         bind("T", self._toggle_dark_mode)
+        bind("Ctrl+F", self._focus_search)
+        bind("G", self._toggle_related_panel)
         bind("Escape", self._toggle_fullscreen)
 
     def _review_keys_active(self) -> bool:
@@ -1910,7 +2124,11 @@ class ReviewWindow(QMainWindow):
         if not self.isActiveWindow():
             return False
         # Never steal keys from a modal dialog (file/progress/message boxes).
-        return QApplication.activeModalWidget() is None
+        if QApplication.activeModalWidget() is not None:
+            return False
+        # Let text fields (e.g. the parent-code search) receive typing/navigation.
+        focus = QApplication.focusWidget()
+        return not isinstance(focus, (QLineEdit, QTextEdit))
 
     def _handle_review_key(self, event) -> bool:
         """Apply an arrow/Tab/Space review control. Returns True if consumed."""
@@ -2076,6 +2294,7 @@ class ReviewWindow(QMainWindow):
         self.tab_strip.apply_theme()
         self.decision_bar.apply_theme()
         self.hero.apply_theme()
+        self.related_panel.apply_theme()
         self.reports_screen.apply_theme()
         self.queue_rail.update()
         self.centralWidget().update()
@@ -2348,6 +2567,10 @@ class ReviewWindow(QMainWindow):
         self.cluster_order = cluster_order
         self.clusters = clusters
         self.by_product = by_product
+        try:
+            self.semantic_suggestions = load_semantic_suggestions(path)
+        except Exception:
+            self.semantic_suggestions = {}
         self.results_path = path
         self.progress = load_progress(path)
         self.progress.setdefault("decisions", {})
@@ -2412,6 +2635,7 @@ class ReviewWindow(QMainWindow):
         if cid is None:
             self.hero.clear()
             self.queue_rail.set_queue([], {}, "")
+            self._refresh_related()
             self._refresh_top()
             return
 
@@ -2420,6 +2644,7 @@ class ReviewWindow(QMainWindow):
         if root is None:
             self.hero.clear()
             self.queue_rail.set_queue([], {}, "")
+            self._refresh_related()
             self._refresh_top()
             return
 
@@ -2433,7 +2658,41 @@ class ReviewWindow(QMainWindow):
         self.selected_product = focus
         self.queue_rail.set_queue(self._candidate_order, statuses, focus)
         self._show_current()
+        self._refresh_related()
         self._refresh_top()
+        self._refocus_window()
+
+    def _refresh_related(self) -> None:
+        """Populate the semantic panel with unique cross-cluster suggestions."""
+        if not hasattr(self, "related_panel"):
+            return
+        cid = self._current_cluster_id()
+        items: list[dict] = []
+        if cid is not None and self.semantic_suggestions:
+            best: dict[str, dict] = {}
+            for member in self.clusters.get(cid, []):
+                for sug in self.semantic_suggestions.get(member["product_number"], []):
+                    if sug.get("suggested_cluster_id") == cid:
+                        continue
+                    sp = sug.get("suggested_product")
+                    if not sp:
+                        continue
+                    current = best.get(sp)
+                    if current is None or score_value(sug.get("semantic_score")) > score_value(
+                        current.get("semantic_score")
+                    ):
+                        best[sp] = sug
+            items = sorted(
+                best.values(),
+                key=lambda s: score_value(s.get("semantic_score")),
+                reverse=True,
+            )[:SEMANTIC_MAX_PER_CLUSTER]
+        self.related_panel.set_items(items)
+
+    def _toggle_related_panel(self) -> None:
+        if not hasattr(self, "related_panel"):
+            return
+        self.related_panel.setVisible(not self.related_panel.isVisible())
         self._refocus_window()
 
     def _pick_initial_focus(self) -> str:
@@ -2579,6 +2838,81 @@ class ReviewWindow(QMainWindow):
         self.selected_product = ""
         self._render_cluster()
         self._refocus_window()
+
+    def _match_cluster(self, query: str) -> tuple[int | None, str | None]:
+        """Find a cluster for a parent/product code.
+
+        Returns (cluster_index, product_to_focus). product_to_focus is None when
+        the match is the parent itself, or the candidate product number to select.
+        """
+        q = query.strip().upper()
+        if not q or not self.cluster_order:
+            return None, None
+
+        roots: list[tuple[int, int, str]] = []
+        for idx, cid in enumerate(self.cluster_order):
+            root = cluster_root(self.clusters.get(cid, []))
+            roots.append((idx, cid, root["product_number"] if root else ""))
+
+        # 1) Exact parent (cluster reference) match.
+        for idx, _cid, rpn in roots:
+            if rpn.upper() == q:
+                return idx, None
+
+        # 2) Exact match on any product — jump to its cluster and focus it.
+        for idx, cid, rpn in roots:
+            for item in self.clusters.get(cid, []):
+                pn = item["product_number"]
+                if pn.upper() == q:
+                    return idx, (None if pn == rpn else pn)
+
+        # 3) Prefix match on a parent code.
+        for idx, _cid, rpn in roots:
+            if rpn.upper().startswith(q):
+                return idx, None
+
+        # 4) Substring match on any product.
+        for idx, cid, rpn in roots:
+            for item in self.clusters.get(cid, []):
+                pn = item["product_number"]
+                if q in pn.upper():
+                    return idx, (None if pn == rpn else pn)
+
+        return None, None
+
+    def _search_parent(self, query: str) -> None:
+        """Jump to the cluster whose parent (or member) matches the code."""
+        text = (query or "").strip()
+        if not text:
+            self._refocus_window()
+            return
+        if not self.cluster_order:
+            QMessageBox.information(self, "No data", "Load a results workbook first.")
+            return
+
+        idx, focus_pn = self._match_cluster(text)
+        if idx is None:
+            QMessageBox.information(
+                self,
+                "Not found",
+                f"No parent or product matches:\n{text}",
+            )
+            self._refocus_window()
+            return
+
+        if self._screen != "review":
+            self.show_review_screen()
+        self.cluster_index = idx
+        self.selected_product = focus_pn or ""
+        self._render_cluster()
+        if focus_pn:
+            self.focus_product(focus_pn)
+        self._refocus_window()
+
+    def _focus_search(self) -> None:
+        if self._screen != "review":
+            self.show_review_screen()
+        self.tab_strip.focus_search()
 
 
 def _crash_log_path() -> Path:

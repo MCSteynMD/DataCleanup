@@ -49,14 +49,9 @@ function Find-ISCC {
 New-Item -ItemType Directory -Path $pkgRoot | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $pkgRoot "input") | Out-Null
 
-# Heavy optional stacks (especially for Review — keep Qt lean).
-$commonExclude = @(
-  "--exclude-module", "torch",
-  "--exclude-module", "torchvision",
-  "--exclude-module", "torchaudio",
+# Always-safe exclusions (dev/test/plotting stacks nothing here needs).
+$baseExclude = @(
   "--exclude-module", "tensorflow",
-  "--exclude-module", "sklearn",
-  "--exclude-module", "scipy",
   "--exclude-module", "matplotlib",
   "--exclude-module", "IPython",
   "--exclude-module", "notebook",
@@ -64,17 +59,25 @@ $commonExclude = @(
   "--exclude-module", "pandas.tests"
 )
 
+# Heavy ML stack — excluded from the Review GUI (it never touches it) but the
+# Engine KEEPS these because the semantic pass needs torch + sentence-transformers.
+$heavyMlExclude = @(
+  "--exclude-module", "torch",
+  "--exclude-module", "torchvision",
+  "--exclude-module", "torchaudio",
+  "--exclude-module", "sklearn",
+  "--exclude-module", "scipy"
+)
+
 # Review GUI no longer imports pandas — strip these so cold start isn't loading 150MB+.
-$reviewExclude = $commonExclude + @(
+$reviewExclude = $baseExclude + $heavyMlExclude + @(
   "--exclude-module", "pandas",
   "--exclude-module", "numpy",
   "--exclude-module", "pyarrow",
   "--exclude-module", "PIL",
   "--exclude-module", "Pillow",
   "--exclude-module", "cryptography",
-  "--exclude-module", "lxml",
-  "--exclude-module", "sklearn",
-  "--exclude-module", "scipy"
+  "--exclude-module", "lxml"
 )
 
 function Assert-LastExit {
@@ -103,12 +106,36 @@ python -m PyInstaller `
   "review_gui.py"
 Assert-LastExit "Similarity Review build"
 
-Write-Host "==> Building Similarity Engine (onedir)..."
-$engineExclude = $commonExclude + @(
+# Ensure the semantic model is vendored so the Engine can bundle it offline.
+$modelDir = Join-Path $PSScriptRoot "models\all-MiniLM-L6-v2"
+if (-not (Test-Path $modelDir) -or -not (Get-ChildItem -LiteralPath $modelDir -EA SilentlyContinue)) {
+  Write-Host "==> Downloading semantic model (one-time)..."
+  python download_model.py | Out-Host
+  Assert-LastExit "Semantic model download"
+}
+
+Write-Host "==> Building Similarity Engine (onedir, with semantic stack)..."
+# Engine keeps the ML stack (torch/scipy) that the semantic pass needs.
+$engineExclude = $baseExclude + @(
   "--exclude-module", "pyarrow",
   "--exclude-module", "PIL",
   "--exclude-module", "Pillow"
 )
+# --collect-all pulls data files + hidden imports for these tricky packages.
+$engineCollect = @(
+  "--collect-all", "torch",
+  "--collect-all", "sentence_transformers",
+  "--collect-all", "transformers",
+  "--collect-all", "tokenizers",
+  "--collect-all", "safetensors",
+  "--collect-all", "huggingface_hub"
+)
+$engineData = @()
+if (Test-Path $modelDir) {
+  $engineData = @("--add-data", "$modelDir;models/all-MiniLM-L6-v2")
+} else {
+  Write-Host "WARNING: semantic model folder missing; Engine will build WITHOUT it."
+}
 python -m PyInstaller `
   --noconfirm `
   --clean `
@@ -118,6 +145,8 @@ python -m PyInstaller `
   --workpath $workEngine `
   --specpath $specDir `
   @engineExclude `
+  @engineCollect `
+  @engineData `
   "similarity.py"
 Assert-LastExit "Similarity Engine build"
 

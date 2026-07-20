@@ -18,6 +18,9 @@ dist/
 build/
 *.spec
 
+# Vendored semantic model (large; fetch with `python download_model.py`)
+models/
+
 # OS / editor
 Thumbs.db
 Desktop.ini
