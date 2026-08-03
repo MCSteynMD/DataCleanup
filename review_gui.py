@@ -20,6 +20,7 @@ S / R               = Reports screen (export for superiors)
 T                   = toggle dark mode
 Ctrl+F              = jump to a parent (cluster reference) code
 G                   = show/hide the Related (semantic) suggestions panel
+Related panel       = Jump to that cluster, or Pull into this cluster (human only)
 
 Progress is saved in separate sidecar files next to the results workbook
 (never modifies the original similarity_results*.xlsx):
@@ -67,6 +68,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from text_normalize import normalize_tokens
 
 def app_base_dir() -> Path:
     """Project / package root (parent of Review/ when frozen)."""
@@ -218,7 +221,7 @@ FONT_TITLE = "Bahnschrift"
 FONT_MONO = "Cascadia Mono"
 
 # Max semantic "possible related" items shown per cluster in the reviewer panel.
-SEMANTIC_MAX_PER_CLUSTER = 12
+SEMANTIC_MAX_PER_CLUSTER = 20
 
 STATUS_LABELS = {
     "duplicate": "Duplicate",
@@ -404,10 +407,8 @@ def normalize_status(status: str) -> str:
 
 
 def tokenize(text: str) -> frozenset[str]:
-    """UPPERCASE whitespace split — same bag-of-words as similarity.py."""
-    if not isinstance(text, str) or not text.strip():
-        return frozenset()
-    return frozenset(text.upper().split())
+    """Same bag-of-words normalization as similarity.py / text_normalize."""
+    return frozenset(normalize_tokens(text))
 
 
 def token_diff(ref_text: str, cand_text: str) -> tuple[set[str], set[str], set[str]]:
@@ -515,6 +516,72 @@ def load_grouped_review(path: Path) -> tuple[list[int], dict[int, list[dict]], d
     return cluster_order, clusters, by_product
 
 
+def _refresh_cluster_sizes(clusters: dict[int, list[dict]]) -> None:
+    for members in clusters.values():
+        size = len(members)
+        for it in members:
+            it["cluster_size"] = size
+            it["n_similar_in_cluster"] = max(size - 1, 0)
+
+
+def apply_cluster_moves(
+    cluster_order: list[int],
+    clusters: dict[int, list[dict]],
+    by_product: dict[str, dict],
+    moves: dict,
+) -> list[int]:
+    """Re-apply reviewer pulls from Related into clusters (sidecar only)."""
+    if not moves:
+        return cluster_order
+
+    for pn, move in moves.items():
+        item = by_product.get(pn)
+        if item is None:
+            continue
+        try:
+            new_cid = int(move.get("cluster_id"))
+        except (TypeError, ValueError):
+            continue
+        old_cid = item.get("cluster_id")
+        if old_cid == new_cid:
+            # Still refresh link fields if present
+            linked = move.get("linked_to_product")
+            if linked:
+                item["linked_to_product"] = linked
+            continue
+
+        if old_cid in clusters:
+            clusters[old_cid] = [
+                i for i in clusters[old_cid] if i["product_number"] != pn
+            ]
+            if not clusters[old_cid]:
+                del clusters[old_cid]
+
+        item["cluster_id"] = new_cid
+        linked = move.get("linked_to_product") or ""
+        if linked:
+            item["linked_to_product"] = linked
+        if item.get("depth", 0) == 0:
+            item["depth"] = 1
+        score = move.get("semantic_score")
+        if score is not None and score != "":
+            try:
+                item["score_to_parent"] = float(score)
+            except (TypeError, ValueError):
+                pass
+
+        clusters.setdefault(new_cid, [])
+        if not any(i["product_number"] == pn for i in clusters[new_cid]):
+            clusters[new_cid].append(item)
+        if new_cid not in cluster_order:
+            cluster_order.append(new_cid)
+
+    # Drop empty clusters from navigation order
+    cluster_order = [cid for cid in cluster_order if clusters.get(cid)]
+    _refresh_cluster_sizes(clusters)
+    return cluster_order
+
+
 def load_semantic_suggestions(path: Path) -> dict[str, list[dict]]:
     """Read the optional 'Semantic Suggestions' sheet.
 
@@ -595,12 +662,14 @@ def load_progress(results_path: Path | None = None) -> dict:
             "decisions": {},
             "clusters_completed": [],
             "parent_times": {},
+            "cluster_moves": {},
         }
     with path.open(encoding="utf-8") as f:
         data = json.load(f)
     data.setdefault("decisions", {})
     data.setdefault("clusters_completed", [])
     data.setdefault("parent_times", {})
+    data.setdefault("cluster_moves", {})
     if results_path is not None:
         data["source_file"] = results_path.name
     return data
@@ -632,13 +701,16 @@ def save_decisions_workbook(
     for pn, dec in decisions.items():
         item = by_product.get(pn, {})
         status = normalize_status(dec.get("status", ""))
+        note = dec.get("note", "")
+        linked = item.get("linked_to_product", "")
         rows.append([
             pn,
             STATUS_LABELS.get(status, status),
             dec.get("cluster_id", item.get("cluster_id", "")),
             item.get("description", ""),
-            item.get("linked_to_product", ""),
+            linked,
             item.get("score_to_parent", ""),
+            note,
             dec.get("updated_at", ""),
         ])
     rows.sort(key=lambda r: (str(r[1]), str(r[2]), str(r[0])))
@@ -648,10 +720,25 @@ def save_decisions_workbook(
     ws.title = "Decisions"
     ws.append([
         "Product", "Decision", "Cluster", "Description",
-        "Linked to", "Score to parent", "Updated (UTC)",
+        "Linked to", "Score to parent", "Note", "Updated (UTC)",
     ])
     for row in rows:
         ws.append(row)
+
+    moves = progress.get("cluster_moves", {}) or {}
+    if moves:
+        ms = wb.create_sheet("Cluster Moves")
+        ms.append([
+            "Product", "To cluster", "From cluster", "Linked to", "Updated (UTC)",
+        ])
+        for pn, move in sorted(moves.items()):
+            ms.append([
+                pn,
+                move.get("cluster_id", ""),
+                move.get("from_cluster_id", ""),
+                move.get("linked_to_product", ""),
+                move.get("updated_at", ""),
+            ])
 
     meta = wb.create_sheet("About", 0)
     meta.append(["Field", "Value"])
@@ -661,6 +748,7 @@ def save_decisions_workbook(
     meta.append(["Updated (UTC)", progress.get("updated_at", utc_now())])
     meta.append(["Note", "Original results workbook is never modified by the reviewer."])
     meta.append(["Decision count", len(rows)])
+    meta.append(["Cluster moves (Related pulls)", len(moves)])
 
     wb.save(out)
     return out
@@ -1878,10 +1966,11 @@ class RelatedPanel(QWidget):
     """Right-side list of cross-cluster semantic suggestions for the current cluster.
 
     Purely mouse-driven (all widgets NoFocus) so it never interferes with the
-    arrow-key review shortcuts. Clicking a row jumps to that product's cluster.
+    arrow-key review shortcuts. Jump opens that product's cluster; Pull moves it
+    into the current cluster after an explicit human click (never automatic).
     """
 
-    PANEL_W = 290
+    PANEL_W = 320
 
     def __init__(self, window: "ReviewWindow") -> None:
         super().__init__()
@@ -1915,14 +2004,14 @@ class RelatedPanel(QWidget):
         self.scroll.setWidget(self._list_host)
         outer.addWidget(self.scroll, 1)
 
-        self._buttons: list[QPushButton] = []
+        self._cards: list[QWidget] = []
         self.apply_theme()
 
     def _clear(self) -> None:
-        for btn in self._buttons:
-            btn.setParent(None)
-            btn.deleteLater()
-        self._buttons = []
+        for card in self._cards:
+            card.setParent(None)
+            card.deleteLater()
+        self._cards = []
 
     def set_items(self, items: list[dict]) -> None:
         self._clear()
@@ -1930,7 +2019,8 @@ class RelatedPanel(QWidget):
             self.hint.setText("No related items for this parent.")
         else:
             self.hint.setText(
-                f"{len(items)} possible related item(s) in other clusters — click to jump."
+                f"{len(items)} possible related item(s) in other clusters — "
+                "Jump to inspect, or Pull into this cluster."
             )
         insert_at = self._list_layout.count() - 1  # keep the trailing stretch last
         for it in items:
@@ -1938,28 +2028,73 @@ class RelatedPanel(QWidget):
             score = format_score(it.get("semantic_score"))
             desc = (it.get("suggested_description") or "").strip()
             short = desc if len(desc) <= 70 else desc[:69] + "…"
-            btn = QPushButton(f"{pn}   ·   {score}\n{short or '(no description)'}")
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            btn.setMinimumHeight(46)
-            btn.setToolTip(f"{pn}\n{desc}")
-            btn.clicked.connect(lambda _=False, p=pn: self._window._search_parent(p))
-            self._list_layout.insertWidget(insert_at, btn)
-            self._buttons.append(btn)
-            insert_at += 1
-        self._style_buttons()
 
-    def _style_buttons(self) -> None:
-        css = f"""
-            QPushButton {{
+            card = QWidget()
+            card.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(0, 0, 0, 0)
+            card_layout.setSpacing(4)
+
+            info = QLabel(f"{pn}   ·   {score}\n{short or '(no description)'}")
+            info.setWordWrap(True)
+            info.setToolTip(f"{pn}\n{desc}")
+            info.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            card_layout.addWidget(info)
+
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            jump_btn = QPushButton("Jump")
+            jump_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            jump_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            jump_btn.setToolTip(f"Open cluster for {pn}")
+            jump_btn.clicked.connect(lambda _=False, p=pn: self._window._search_parent(p))
+            pull_btn = QPushButton("Pull in")
+            pull_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            pull_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            pull_btn.setToolTip(
+                f"Move {pn} into this cluster and mark as duplicate (human action only)"
+            )
+            pull_btn.clicked.connect(
+                lambda _=False, p=pn, s=it: self._window.pull_related_into_cluster(p, s)
+            )
+            row.addWidget(jump_btn, 1)
+            row.addWidget(pull_btn, 1)
+            card_layout.addLayout(row)
+
+            self._list_layout.insertWidget(insert_at, card)
+            self._cards.append(card)
+            insert_at += 1
+        self._style_cards()
+
+    def _style_cards(self) -> None:
+        card_css = f"""
+            QWidget {{
                 background: {Theme.surface.name()};
                 color: {Theme.ink.name()};
                 border: 1px solid {Theme.paper_deep.name()};
                 border-left: 3px solid {Theme.teal.name()};
                 border-radius: 2px;
-                padding: 8px 10px;
-                text-align: left;
+            }}
+        """
+        label_css = f"""
+            QLabel {{
+                background: transparent;
+                color: {Theme.ink.name()};
+                border: none;
+                padding: 8px 10px 0 10px;
                 font-family: {FONT_MONO};
+                font-size: 9pt;
+            }}
+        """
+        jump_css = f"""
+            QPushButton {{
+                background: {Theme.paper.name()};
+                color: {Theme.ink.name()};
+                border: 1px solid {Theme.paper_deep.name()};
+                border-radius: 2px;
+                padding: 6px 8px;
+                font-family: {FONT_TITLE};
                 font-size: 9pt;
             }}
             QPushButton:hover {{
@@ -1967,15 +2102,37 @@ class RelatedPanel(QWidget):
                 background: {Theme.hover_tint};
             }}
         """
-        for btn in self._buttons:
-            btn.setStyleSheet(css)
+        pull_css = f"""
+            QPushButton {{
+                background: {Theme.teal.name()};
+                color: #FFFFFF;
+                border: 1px solid {Theme.teal.name()};
+                border-radius: 2px;
+                padding: 6px 8px;
+                font-family: {FONT_TITLE};
+                font-size: 9pt;
+            }}
+            QPushButton:hover {{
+                border-color: {Theme.accent.name()};
+            }}
+        """
+        for card in self._cards:
+            card.setStyleSheet(card_css)
+            for child in card.findChildren(QLabel):
+                child.setStyleSheet(label_css)
+            buttons = card.findChildren(QPushButton)
+            if len(buttons) >= 2:
+                buttons[0].setStyleSheet(jump_css)
+                buttons[1].setStyleSheet(pull_css)
+            elif buttons:
+                buttons[0].setStyleSheet(jump_css)
 
     def apply_theme(self) -> None:
         self.caption.setStyleSheet(f"color: {Theme.ink.name()}; letter-spacing: 1px;")
         self.hint.setStyleSheet(f"color: {Theme.ink_muted.name()};")
         self.scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         self._list_host.setStyleSheet("background: transparent;")
-        self._style_buttons()
+        self._style_cards()
         self.update()
 
     def paintEvent(self, _event) -> None:
@@ -2576,7 +2733,14 @@ class ReviewWindow(QMainWindow):
         self.progress.setdefault("decisions", {})
         self.progress.setdefault("clusters_completed", [])
         self.progress.setdefault("parent_times", {})
+        self.progress.setdefault("cluster_moves", {})
         self.progress["source_file"] = path.name
+        self.cluster_order = apply_cluster_moves(
+            self.cluster_order,
+            self.clusters,
+            self.by_product,
+            self.progress.get("cluster_moves", {}),
+        )
         self._persist()
         self.cluster_index = self._first_incomplete_cluster_index()
         self.selected_product = ""
@@ -2672,10 +2836,14 @@ class ReviewWindow(QMainWindow):
             best: dict[str, dict] = {}
             for member in self.clusters.get(cid, []):
                 for sug in self.semantic_suggestions.get(member["product_number"], []):
-                    if sug.get("suggested_cluster_id") == cid:
-                        continue
                     sp = sug.get("suggested_product")
                     if not sp:
+                        continue
+                    # Skip if already in this cluster (including after a pull).
+                    suggested_item = self.by_product.get(sp)
+                    if suggested_item is not None and suggested_item.get("cluster_id") == cid:
+                        continue
+                    if sug.get("suggested_cluster_id") == cid:
                         continue
                     current = best.get(sp)
                     if current is None or score_value(sug.get("semantic_score")) > score_value(
@@ -2688,6 +2856,93 @@ class ReviewWindow(QMainWindow):
                 reverse=True,
             )[:SEMANTIC_MAX_PER_CLUSTER]
         self.related_panel.set_items(items)
+
+    def pull_related_into_cluster(
+        self,
+        product_number: str,
+        suggestion: dict | None = None,
+    ) -> None:
+        """Explicit human action: move a Related product into the current cluster."""
+        if self._screen != "review":
+            return
+        cid = self._current_cluster_id()
+        if cid is None:
+            return
+        item = self.by_product.get(product_number)
+        if item is None:
+            QMessageBox.warning(
+                self,
+                "Unknown product",
+                f"Could not find product {product_number} in the loaded results.",
+            )
+            return
+        if item.get("cluster_id") == cid:
+            self._refresh_related()
+            return
+
+        ref = self._reference_pn or ""
+        if not ref:
+            root = cluster_root(self.clusters.get(cid, []))
+            ref = root["product_number"] if root else ""
+
+        old_cid = item.get("cluster_id")
+        semantic_score = None
+        if suggestion:
+            semantic_score = suggestion.get("semantic_score")
+
+        # Remove from old cluster
+        if old_cid in self.clusters:
+            self.clusters[old_cid] = [
+                i for i in self.clusters[old_cid] if i["product_number"] != product_number
+            ]
+            if not self.clusters[old_cid]:
+                del self.clusters[old_cid]
+                if old_cid in self.cluster_order:
+                    removed_at = self.cluster_order.index(old_cid)
+                    self.cluster_order.pop(removed_at)
+                    if removed_at < self.cluster_index:
+                        self.cluster_index = max(0, self.cluster_index - 1)
+                    elif self.cluster_index >= len(self.cluster_order):
+                        self.cluster_index = max(0, len(self.cluster_order) - 1)
+
+        item["cluster_id"] = cid
+        if ref:
+            item["linked_to_product"] = ref
+        if item.get("depth", 0) == 0:
+            item["depth"] = 1
+        if semantic_score is not None and semantic_score != "":
+            try:
+                item["score_to_parent"] = float(semantic_score)
+            except (TypeError, ValueError):
+                pass
+
+        members = self.clusters.setdefault(cid, [])
+        if not any(i["product_number"] == product_number for i in members):
+            members.append(item)
+        _refresh_cluster_sizes(self.clusters)
+
+        moves = self.progress.setdefault("cluster_moves", {})
+        moves[product_number] = {
+            "cluster_id": cid,
+            "from_cluster_id": old_cid,
+            "linked_to_product": ref,
+            "semantic_score": semantic_score,
+            "updated_at": utc_now(),
+        }
+        self.progress["decisions"][product_number] = {
+            "status": "duplicate",
+            "note": "pulled_from_related",
+            "cluster_id": cid,
+            "updated_at": utc_now(),
+        }
+        # Keep current cluster index pointing at the same id after order changes
+        if cid in self.cluster_order:
+            self.cluster_index = self.cluster_order.index(cid)
+
+        self._persist()
+        self.selected_product = product_number
+        self._render_cluster()
+        self._refocus_window()
 
     def _toggle_related_panel(self) -> None:
         if not hasattr(self, "related_panel"):

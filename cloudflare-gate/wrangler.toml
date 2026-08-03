@@ -1,0 +1,26 @@
+name = "marnus-cleanup23"
+main = "src/index.js"
+compatibility_date = "2025-07-01"
+workers_dev = false
+account_id = "c88262391deb24e90743edc5cef00cf8"
+
+routes = [
+  { pattern = "cleanup23.tabletoptools.cc", custom_domain = true }
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cleanup-db"
+database_id = "4e622e8c-ef0f-4d9a-9eb0-41521e6bb0a0"
+
+[[kv_namespaces]]
+binding = "CATALOG"
+id = "51ecfd52310448a29b0ec5b2542d9bb0"
+
+[ai]
+binding = "AI"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = true

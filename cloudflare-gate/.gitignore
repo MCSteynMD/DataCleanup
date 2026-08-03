@@ -1,0 +1,4 @@
+# Cloudflare gate secrets / local overrides — do not commit
+.dev.vars
+.wrangler/
+node_modules/

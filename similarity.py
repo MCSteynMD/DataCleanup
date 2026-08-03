@@ -3,10 +3,10 @@ Similarity check for ~30k descriptions.
 
 Method
 ------
-  1. Normalize each description: UPPERCASE, split on whitespace, dedupe -> token set.
-     The set is then joined back as a single alphabetically-sorted string
-     ("canonical form") so the same words always show up in the same order
-     and rows can be eyeballed side-by-side.
+  1. Normalize each description via text_normalize: UPPERCASE, split on
+     whitespace / - _ , expand dim codes (M8X50), light synonym/plural folds,
+     dedupe -> token set. Joined as an alphabetically-sorted "canonical form"
+     so the same words always show up in the same order for eyeballing.
   2. Compute exact Jaccard similarity between every pair of rows:
          J(A, B) = |A ∩ B| / |A ∪ B|
   3. Speed tricks:
@@ -52,6 +52,7 @@ from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from text_normalize import tokenize
 
 # ===== CONFIG ================================================================
 
@@ -68,9 +69,9 @@ PRODUCT_NUMBER_COLUMN: str | None = None    # column name; None = auto-detect
 
 OUTPUT_FILE = "similarity_results.xlsx"
 
-SIMILARITY_THRESHOLD = 0.50   # 0..1; pairs >= this are "matches" and join a cluster
+SIMILARITY_THRESHOLD = 0.60   # 0..1; pairs >= this are "matches" and join a cluster
 TOP_N_MATCHES = 10            # how many neighbours to keep per row (legacy wide sheet)
-REVIEW_PAIRS_MIN_SCORE = 0.50 # minimum score on the readable "Review Pairs" sheet
+REVIEW_PAIRS_MIN_SCORE = 0.60 # minimum score on the readable "Review Pairs" sheet
 EMIT_WIDE_TOP_MATCHES = False # legacy 67-column sheet — usually not needed
 EMIT_ALL_PAIRS_SHEET = False  # full pair dump — use Review Pairs instead
 
@@ -83,14 +84,15 @@ MAX_DOC_FREQUENCY = 0.0
 # A sentence-transformers model embeds every description and finds near
 # neighbours that landed in a DIFFERENT cluster. These never change the strict
 # Jaccard clusters; they are written to a "Semantic Suggestions" sheet and shown
-# in the reviewer as click-to-jump hints so a human can catch vague synonym
-# cases (e.g. "ZIP TIE" vs "CABLE TIE") the lexical matcher misses.
+# in the reviewer as Jump / Pull-in hints so a human can catch vague synonym
+# cases (e.g. "ZIP TIE" vs "CABLE TIE") the lexical matcher misses. Pull-in is
+# always an explicit reviewer action — never an automatic cluster merge.
 SEMANTIC_ENABLED = True
 # Path to a bundled model folder (offline). Absolute, or relative to this file
 # / the PyInstaller bundle. Pre-download all-MiniLM-L6-v2 into models/.
 SEMANTIC_MODEL_PATH = "models/all-MiniLM-L6-v2"
-SEMANTIC_THRESHOLD = 0.55   # cosine 0..1; higher = stricter / fewer suggestions
-SEMANTIC_TOP_K = 5          # max cross-cluster suggestions kept per product
+SEMANTIC_THRESHOLD = 0.50   # cosine 0..1; Related suggestions only at/above this
+SEMANTIC_TOP_K = 10         # max cross-cluster suggestions kept per product
 SEMANTIC_BATCH_SIZE = 256   # embedding batch size
 
 # =============================================================================
@@ -229,16 +231,6 @@ def autodetect_description_column(df: pd.DataFrame, exclude: str | None) -> str:
         if df[col].dtype == object:
             return col
     return df.columns[0]
-
-
-def tokenize(text: str) -> tuple[frozenset[str], str]:
-    """UPPERCASE, split on whitespace, dedupe. Returns the token set AND the
-    canonical alphabetical form for eyeball comparison."""
-    if not isinstance(text, str):
-        return frozenset(), ""
-    tokens = frozenset(text.upper().split())
-    canonical = " ".join(sorted(tokens))
-    return tokens, canonical
 
 
 GROUP_FILLS = (
@@ -522,7 +514,7 @@ def build_semantic_suggestions_df(
             batch_size=int(SEMANTIC_BATCH_SIZE),
             convert_to_numpy=True,
             normalize_embeddings=True,
-            show_progress_bar=False,
+            show_progress_bar=True,
         ).astype(np.float32)
     except Exception as exc:  # noqa: BLE001
         print(f"  Semantic pass skipped (encode failed): {exc}")
@@ -534,6 +526,7 @@ def build_semantic_suggestions_df(
     kbuf = min(m - 1, max(k * 4, k + 8))
     block = 512
     rows: list[dict] = []
+    print(f"Semantic pass: finding cross-cluster neighbours (threshold ≥ {thr:.0%}) ...")
 
     for start in range(0, m, block):
         stop = min(start + block, m)
@@ -574,7 +567,8 @@ def build_semantic_suggestions_df(
                     if kept >= k:
                         break
         done = min(stop, m)
-        print(f"  semantic neighbours {done:,} / {m:,} unique")
+        pct = 100.0 * done / m if m else 100.0
+        print(f"  semantic neighbours {done:,} / {m:,} unique ({pct:5.1f}%)  ·  {len(rows):,} suggestions")
 
     if not rows:
         return pd.DataFrame(columns=SEMANTIC_COLUMNS)
