@@ -513,6 +513,16 @@ def load_grouped_review(path: Path) -> tuple[list[int], dict[int, list[dict]], d
     finally:
         wb.close()
 
+    def _parent_name(cid: int) -> str:
+        members = clusters.get(cid) or []
+        if not members:
+            return ""
+        root = next((m for m in members if int(m.get("depth") or 0) == 0), None)
+        if root is None:
+            root = min(members, key=lambda m: int(m.get("position_in_cluster") or 0))
+        return (root.get("description") or "").casefold()
+
+    cluster_order = sorted(cluster_order, key=lambda cid: (_parent_name(cid), cid))
     return cluster_order, clusters, by_product
 
 

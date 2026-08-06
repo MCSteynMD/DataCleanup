@@ -70,3 +70,34 @@ CREATE TABLE IF NOT EXISTS job_meta (
   job_id TEXT PRIMARY KEY,
   cluster_order TEXT NOT NULL DEFAULT '[]'
 );
+
+CREATE TABLE IF NOT EXISTS work_sessions (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  login_local TEXT NOT NULL,
+  login_utc TEXT NOT NULL,
+  logout_local TEXT,
+  logout_utc TEXT,
+  tz_offset_min INTEGER,
+  tz_name TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_sessions_email_login
+  ON work_sessions (email, login_utc);
+
+CREATE TABLE IF NOT EXISTS related_dump (
+  job_id TEXT NOT NULL,
+  cluster_id INTEGER NOT NULL,
+  suggested_product TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (job_id, cluster_id, suggested_product)
+);
+
+CREATE TABLE IF NOT EXISTS related_blob (
+  job_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  data BLOB NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (job_id, name)
+);

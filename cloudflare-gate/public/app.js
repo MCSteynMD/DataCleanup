@@ -1,4 +1,23 @@
-import { clusterProducts, tokenDiff } from "./engine.js?v=15";
+import { clusterProducts, tokenDiff } from "./engine.js?v=16";
+
+/** Parent/reference description for alphabetical cluster ordering. */
+function clusterParentName(clusters, cid) {
+  const items = clusters?.[cid] || [];
+  if (!items.length) return "";
+  const root =
+    items.find((it) => Number(it.depth) === 0) ||
+    items.slice().sort((a, b) => (a.position_in_cluster || 0) - (b.position_in_cluster || 0))[0];
+  return String(root?.description || "").trim();
+}
+
+/** Sort review cluster ids A→Z by parent item name (description). */
+function sortClusterOrderByName(clusterOrder, clusters) {
+  return (clusterOrder || []).slice().sort((a, b) => {
+    const na = clusterParentName(clusters, a).toLocaleLowerCase();
+    const nb = clusterParentName(clusters, b).toLocaleLowerCase();
+    return na.localeCompare(nb) || Number(a) - Number(b);
+  });
+}
 
 const $ = (sel) => document.querySelector(sel);
 const THEME_KEY = "cleanup-dark-mode";
@@ -8,6 +27,7 @@ const state = {
   catalog: null,
   decisions: {},
   moves: {},
+  relatedDumps: new Set(), // `${clusterId}|${suggested_product}`
   completed: new Set(),
   parentTimes: {},
   progressUpdatedAt: "",
@@ -19,6 +39,19 @@ const state = {
   timerStartedAt: null,
   clockHandle: null,
 };
+
+function dumpKey(clusterId, suggestedProduct) {
+  return `${Number(clusterId)}|${String(suggestedProduct)}`;
+}
+
+function loadRelatedDumps(rows) {
+  const set = new Set();
+  for (const r of rows || []) {
+    if (r?.suggested_product == null || r?.cluster_id == null) continue;
+    set.add(dumpKey(r.cluster_id, r.suggested_product));
+  }
+  state.relatedDumps = set;
+}
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -432,6 +465,82 @@ function showReviewFromReports() {
   renderCluster();
 }
 
+function defaultTimesheetRange() {
+  const to = new Date();
+  const from = new Date(to);
+  from.setDate(from.getDate() - 31);
+  const iso = (d) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return { from: iso(from), to: iso(to) };
+}
+
+function showTimesheetScreen() {
+  pauseParentTimer({ persist: true });
+  const fromEl = $("#tsFrom");
+  const toEl = $("#tsTo");
+  if (fromEl && !fromEl.value) {
+    const r = defaultTimesheetRange();
+    fromEl.value = r.from;
+    toEl.value = r.to;
+  }
+  showScreen("timesheet");
+  loadTimesheet().catch((e) => alert(e.message || String(e)));
+}
+
+async function loadTimesheet() {
+  const from = $("#tsFrom")?.value || "";
+  const to = $("#tsTo")?.value || "";
+  const qs = new URLSearchParams();
+  if (from) qs.set("from", from);
+  if (to) qs.set("to", to);
+  const data = await api(`/api/timesheet?${qs}`);
+  const kpis = $("#timesheetKpis");
+  if (kpis) {
+    const t = data.totals || {};
+    kpis.innerHTML = [
+      `<div class="kpi"><strong>Sessions</strong><div>${(t.sessions || 0).toLocaleString()}</div><span>${t.closed || 0} closed · ${t.open || 0} open</span></div>`,
+      `<div class="kpi"><strong>Total hours</strong><div>${t.total_label || "0:00"}</div><span>closed sessions only</span></div>`,
+      `<div class="kpi"><strong>Days worked</strong><div>${(data.daily || []).length}</div><span>with a closed session</span></div>`,
+      `<div class="kpi"><strong>Range</strong><div style="font-size:1rem">${from || "…"} → ${to || "…"}</div><span>local login dates</span></div>`,
+    ].join("");
+  }
+  const body = $("#timesheetTable tbody");
+  if (!body) return;
+  const rows = data.sessions || [];
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="6">No login sessions in this range yet. Sign out at end of day to close a session.</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows
+    .map((s) => {
+      const login = String(s.login_local || "").replace("T", " ");
+      const logout = s.logout_local ? String(s.logout_local).replace("T", " ") : "—";
+      const tz =
+        s.tz_name ||
+        (s.tz_offset_min != null
+          ? `UTC${s.tz_offset_min >= 0 ? "+" : ""}${Math.trunc(s.tz_offset_min / 60)}`
+          : "—");
+      return `<tr>
+        <td>${escapeHtml(s.date || "")}</td>
+        <td>${escapeHtml(login)}</td>
+        <td>${escapeHtml(logout)}</td>
+        <td>${escapeHtml(s.duration_label || "—")}</td>
+        <td>${escapeHtml(tz)}</td>
+        <td>${escapeHtml(s.status)}</td>
+      </tr>`;
+    })
+    .join("");
+}
+
+function exportTimesheetCsv() {
+  const from = $("#tsFrom")?.value || "";
+  const to = $("#tsTo")?.value || "";
+  const qs = new URLSearchParams({ format: "csv" });
+  if (from) qs.set("from", from);
+  if (to) qs.set("to", to);
+  window.location.href = `/api/timesheet?${qs}`;
+}
+
 function renderReports() {
   const stats = computeReviewStats();
   const decisionRows = buildDecisionRows();
@@ -759,14 +868,18 @@ function parseResultsWorkbook(wb) {
   }
 
   const nUnmatched = Object.values(byProduct).filter((it) => (it.cluster_size || 0) <= 1).length;
+  const reviewOrder = sortClusterOrderByName(
+    clusterOrder.filter((cid) => (clusters[cid]?.length || 0) > 1),
+    clusters,
+  );
   return {
-    cluster_order: clusterOrder,
+    cluster_order: reviewOrder,
     clusters,
     by_product: byProduct,
     semantic,
     stats: {
       n_products: Object.keys(byProduct).length,
-      n_clusters: clusterOrder.length,
+      n_clusters: reviewOrder.length,
       n_in_clusters: Object.keys(byProduct).length - nUnmatched,
       n_unmatched: nUnmatched,
       n_from_clusters_sheet: unmatchedAdded,
@@ -1309,6 +1422,7 @@ async function openJob(id, localCatalog = null) {
         data.clusters_completed = partial.clusters_completed || [];
         data.parent_times = partial.parent_times || {};
         data.progress_updated_at = partial.progress_updated_at || "";
+        data.related_dumps = partial.related_dumps || [];
         if (partial.catalog?.cluster_order?.length) data.catalog = partial.catalog;
       } catch {
         /* keep local */
@@ -1321,6 +1435,7 @@ async function openJob(id, localCatalog = null) {
     state.catalog = applyMoves(data.catalog, data.moves || {});
     state.decisions = data.decisions || {};
     state.moves = data.moves || {};
+    loadRelatedDumps(data.related_dumps);
     state.completed = new Set(
       (data.clusters_completed || []).map((x) => Number(x)).filter((n) => Number.isFinite(n)),
     );
@@ -1344,8 +1459,7 @@ async function openJob(id, localCatalog = null) {
       for (const [cid, members] of Object.entries(clusters)) {
         if (members.length > 1) seen.push(Number(cid));
       }
-      seen.sort((a, b) => a - b);
-      state.catalog.cluster_order = seen;
+      state.catalog.cluster_order = sortClusterOrderByName(seen, clusters);
       state.catalog.clusters = clusters;
     } else if (state.catalog.by_product && !state.catalog.clusters) {
       const clusters = {};
@@ -1370,6 +1484,22 @@ async function openJob(id, localCatalog = null) {
       );
     }
     if (!state.catalog.cluster_order) state.catalog.cluster_order = [];
+    // Always present review queue A→Z by parent item name
+    const previousCid =
+      state.catalog.cluster_order[state.clusterIndex] ??
+      null;
+    if (state.catalog.clusters) {
+      state.catalog.cluster_order = sortClusterOrderByName(
+        state.catalog.cluster_order.filter(
+          (cid) => (state.catalog.clusters[cid]?.length || 0) > 1,
+        ),
+        state.catalog.clusters,
+      );
+    }
+    if (previousCid != null) {
+      const remapped = state.catalog.cluster_order.indexOf(previousCid);
+      state.clusterIndex = remapped >= 0 ? remapped : 0;
+    }
     if (state.clusterIndex >= state.catalog.cluster_order.length) state.clusterIndex = 0;
     showScreen(state.catalog.cluster_order.length ? "review" : "reports");
     ensureClock();
@@ -1560,14 +1690,21 @@ function renderRelated() {
   const cid = state.catalog.cluster_order[state.clusterIndex];
   const panel = $("#relatedPanel");
   const semantic = state.catalog.semantic || {};
+  const members = state.catalog.clusters[cid] || [];
+  const memberPns = new Set(members.map((m) => m.product_number));
+  if (state.reference) memberPns.add(state.reference);
+
   const best = {};
-  for (const member of state.catalog.clusters[cid] || []) {
+  for (const member of members) {
     for (const sug of semantic[member.product_number] || []) {
       const sp = sug.suggested_product;
       if (!sp) continue;
+      // Never suggest something already in this cluster (parent or any child).
+      if (memberPns.has(sp)) continue;
+      if (state.relatedDumps.has(dumpKey(cid, sp))) continue;
       const other = state.catalog.by_product[sp];
       if (other && other.cluster_id === cid) continue;
-      if (sug.suggested_cluster_id === cid) continue;
+      if (Number(sug.suggested_cluster_id) === Number(cid)) continue;
       const cur = best[sp];
       if (!cur || scoreVal(sug.semantic_score) > scoreVal(cur.semantic_score)) best[sp] = sug;
     }
@@ -1576,7 +1713,7 @@ function renderRelated() {
     .sort((a, b) => scoreVal(b.semantic_score) - scoreVal(a.semantic_score))
     .slice(0, 20);
 
-  panel.innerHTML = `<h3>Related</h3><div class="hint">${items.length ? `${items.length} cross-cluster suggestion(s)` : "No related suggestions for this cluster."}</div>${items
+  panel.innerHTML = `<h3>Related</h3><div class="hint">${items.length ? `${items.length} from other clusters` : "No related suggestions for this cluster."}</div>${items
     .map((it) => {
       const desc = String(it.suggested_description || "");
       const short = desc.length > 70 ? `${desc.slice(0, 69)}…` : desc;
@@ -1584,8 +1721,9 @@ function renderRelated() {
         <div class="pn">${escapeHtml(it.suggested_product)} <span class="score">· ${escapeHtml(formatScore(it.semantic_score))}</span></div>
         <div class="d">${escapeHtml(short || "(no description)")}</div>
         <div class="row">
-          <button type="button" class="btn" data-jump="${escapeHtml(it.suggested_product)}">Jump</button>
-          <button type="button" class="btn primary" data-pull='${escapeHtml(JSON.stringify(it))}'>Pull in</button>
+          <button type="button" class="btn" data-jump="${escapeHtml(it.suggested_product)}" title="Open this product’s current cluster">View cluster</button>
+          <button type="button" class="btn primary" data-pull='${escapeHtml(JSON.stringify(it))}' title="Move this product into the cluster you’re reviewing">Move here</button>
+          <button type="button" class="btn danger" data-dump="${escapeHtml(it.suggested_product)}" title="Not related — hide this suggestion for this cluster">Dump</button>
         </div>
       </div>`;
     })
@@ -1603,6 +1741,11 @@ function renderRelated() {
       }
     });
   });
+  panel.querySelectorAll("[data-dump]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      dumpRelated(btn.getAttribute("data-dump")).catch((e) => alert(e.message || String(e)));
+    });
+  });
 }
 
 function jumpToProduct(pn) {
@@ -1613,6 +1756,18 @@ function jumpToProduct(pn) {
   state.clusterIndex = idx;
   state.selected = pn;
   renderCluster();
+}
+
+async function dumpRelated(suggestedProduct) {
+  const cid = state.catalog.cluster_order[state.clusterIndex];
+  const sp = String(suggestedProduct || "").trim();
+  if (!state.jobId || cid == null || !sp) return;
+  await api(`/api/jobs/${state.jobId}/related/dump`, {
+    method: "POST",
+    body: JSON.stringify({ cluster_id: cid, suggested_product: sp }),
+  });
+  state.relatedDumps.add(dumpKey(cid, sp));
+  renderRelated();
 }
 
 async function pullIn(sug) {
@@ -1632,8 +1787,17 @@ async function pullIn(sug) {
   });
   const data = await api(`/api/jobs/${state.jobId}`);
   state.catalog = applyMoves(data.catalog, data.moves || {});
+  if (state.catalog?.clusters) {
+    state.catalog.cluster_order = sortClusterOrderByName(
+      (state.catalog.cluster_order || []).filter(
+        (id) => (state.catalog.clusters[id]?.length || 0) > 1,
+      ),
+      state.catalog.clusters,
+    );
+  }
   state.decisions = data.decisions || {};
   state.moves = data.moves || {};
+  loadRelatedDumps(data.related_dumps);
   state.selected = pn;
   const idx = state.catalog.cluster_order.indexOf(cid);
   if (idx >= 0) state.clusterIndex = idx;
@@ -1926,6 +2090,7 @@ function wireReview() {
       .finally(() => setProgress(false));
   });
   $("#btnReports")?.addEventListener("click", () => showReportsScreen());
+  $("#btnTimesheet")?.addEventListener("click", () => showTimesheetScreen());
   $("#btnRelatedRun")?.addEventListener("click", () => {
     if (!state.jobId) {
       alert("Open a job first.");
@@ -1936,6 +2101,14 @@ function wireReview() {
   $("#btnReportsRefresh")?.addEventListener("click", () => renderReports());
   $("#btnReportsExcel")?.addEventListener("click", () => exportManagementExcel());
   $("#btnReportsBack")?.addEventListener("click", () => showReviewFromReports());
+  $("#btnTimesheetRefresh")?.addEventListener("click", () => {
+    loadTimesheet().catch((e) => alert(e.message || String(e)));
+  });
+  $("#btnTimesheetCsv")?.addEventListener("click", () => exportTimesheetCsv());
+  $("#btnTimesheetBack")?.addEventListener("click", () => {
+    if (state.catalog) showReviewFromReports();
+    else showScreen("upload");
+  });
   $("#btnFocus")?.addEventListener("click", () => {
     toggleFocusMode().catch((e) => console.warn(e));
   });

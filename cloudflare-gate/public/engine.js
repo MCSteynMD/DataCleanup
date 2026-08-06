@@ -208,11 +208,24 @@ export async function clusterProducts(rows, onProgress) {
     if (members.length > 1) multi.push(members);
     else singles.push(members);
   }
-  multi.sort((a, b) => b.length - a.length);
+  // Review queue: alphabetical by parent item name (description)
+  multi.sort((a, b) => {
+    const nameA = String(rows[a[0]].description || "").toLocaleLowerCase();
+    const nameB = String(rows[b[0]].description || "").toLocaleLowerCase();
+    return (
+      nameA.localeCompare(nameB) ||
+      String(rows[a[0]].product_number).localeCompare(String(rows[b[0]].product_number))
+    );
+  });
   // Stable order for unmatched products
-  singles.sort((a, b) =>
-    String(rows[a[0]].product_number).localeCompare(String(rows[b[0]].product_number)),
-  );
+  singles.sort((a, b) => {
+    const nameA = String(rows[a[0]].description || "").toLocaleLowerCase();
+    const nameB = String(rows[b[0]].description || "").toLocaleLowerCase();
+    return (
+      nameA.localeCompare(nameB) ||
+      String(rows[a[0]].product_number).localeCompare(String(rows[b[0]].product_number))
+    );
+  });
 
   const clusterOrder = [];
   const clusters = {};

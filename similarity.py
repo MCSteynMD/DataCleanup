@@ -382,11 +382,25 @@ def build_grouped_review_df(
     for i, cid in enumerate(cluster_ids):
         by_cluster[cid].append(i)
 
+    def _cluster_parent_name(cid: int) -> str:
+        members = by_cluster[cid]
+        if not members:
+            return ""
+        # Prefer BFS root (highest degree); fall back to first member.
+        adj_local = adj
+        member_set = set(members)
+
+        def degree(node: int) -> int:
+            return sum(1 for nb in adj_local.get(node, {}) if nb in member_set)
+
+        root = min(members, key=lambda n: (-degree(n), n)) if len(members) > 1 else members[0]
+        return (descriptions[root] or "").casefold()
+
     cluster_order = sorted(
         by_cluster.keys(),
         key=lambda cid: (
             cluster_sizes[cid] <= 1,
-            -cluster_sizes[cid],
+            _cluster_parent_name(cid),
             cid,
         ),
     )
