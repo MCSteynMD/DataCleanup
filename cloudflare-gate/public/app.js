@@ -237,15 +237,26 @@ function pct(part, whole) {
 
 function computeReviewStats() {
   const byProduct = state.catalog?.by_product || {};
+  const clusters = state.catalog?.clusters || {};
   const clusterOrder = state.catalog?.cluster_order || [];
   const reviewCids = new Set(clusterOrder);
   const decisions = state.decisions || {};
   const completed = state.completed || new Set();
   const counts = { duplicate: 0, unique: 0, discard: 0, skip: 0 };
+
+  // Parent/reference products are not in the duel queue — exclude them from
+  // reviewable totals so "all children marked" can reach 100%.
+  const parentPns = new Set();
+  for (const cid of clusterOrder) {
+    const root = clusterRoot(clusters[cid] || []);
+    if (root?.product_number) parentPns.add(root.product_number);
+  }
+
   let reviewedInQueue = 0;
   for (const [pn, dec] of Object.entries(decisions)) {
     const item = byProduct[pn];
     if (!item) continue;
+    if (parentPns.has(pn)) continue;
     const st = normalizeStatus(dec.status);
     if (counts[st] != null) counts[st] += 1;
     if (reviewCids.has(item.cluster_id) && (item.cluster_size || 0) > 1) {
@@ -256,9 +267,11 @@ function computeReviewStats() {
   const total = Object.keys(byProduct).length;
   let unmatched = 0;
   let reviewable = 0;
+  for (const cid of clusterOrder) {
+    reviewable += clusterCandidates(clusters[cid] || []).length;
+  }
   for (const it of Object.values(byProduct)) {
     if ((it.cluster_size || 0) <= 1) unmatched += 1;
-    else reviewable += 1;
   }
   const nClusters = clusterOrder.length;
   const nClustersDone = clusterOrder.filter((cid) => completed.has(cid)).length;
@@ -266,11 +279,9 @@ function computeReviewStats() {
   let currentClusterSize = 0;
   let currentClusterReviewed = 0;
   if (currentClusterId != null) {
-    for (const item of Object.values(byProduct)) {
-      if (item.cluster_id !== currentClusterId) continue;
-      currentClusterSize += 1;
-      if (decisions[item.product_number]) currentClusterReviewed += 1;
-    }
+    const cands = clusterCandidates(clusters[currentClusterId] || []);
+    currentClusterSize = cands.length;
+    currentClusterReviewed = cands.filter((i) => decisions[i.product_number]).length;
   }
   const times = { ...parentTimesNormalized() };
   if (state.timerClusterId != null && state.timerStartedAt != null) {
@@ -410,22 +421,24 @@ function buildClusterReportRows() {
   ];
   return allIds.map((cid) => {
     const items = clusters[cid] || [];
+    const root = clusterRoot(items);
+    const cands = clusterCandidates(items);
     const counts = { duplicate: 0, unique: 0, discard: 0 };
-    for (const item of items) {
+    for (const item of cands) {
       const dec = decisions[item.product_number];
       if (!dec) continue;
       const st = normalizeStatus(dec.status);
       if (counts[st] != null) counts[st] += 1;
     }
     const marked = counts.duplicate + counts.unique + counts.discard;
-    const root = clusterRoot(items);
+    const queueSize = cands.length;
     const seconds = times[String(cid)] || 0;
     const singleton = items.length <= 1;
     return {
       cluster_id: cid,
       size: items.length,
       marked,
-      remaining: Math.max(items.length - marked, 0),
+      remaining: Math.max(queueSize - marked, 0),
       duplicate: counts.duplicate,
       unique: counts.unique,
       discard: counts.discard,
@@ -717,6 +730,14 @@ function clusterRoot(items) {
   const roots = items.filter((i) => i.depth === 0);
   if (!roots.length) return items.slice().sort((a, b) => a.position_in_cluster - b.position_in_cluster)[0];
   return roots.slice().sort((a, b) => a.position_in_cluster - b.position_in_cluster)[0];
+}
+
+/** Children only — the parent/reference is never marked in the duel queue. */
+function clusterCandidates(items) {
+  if (!items?.length) return [];
+  const root = clusterRoot(items);
+  const rootPn = root?.product_number;
+  return items.filter((i) => i.product_number !== rootPn);
 }
 
 function scoreVal(v) {
@@ -1565,11 +1586,12 @@ function updateTop() {
   }
   const cid = order[state.clusterIndex];
   const items = cid == null ? [] : state.catalog.clusters[cid] || [];
-  const marked = items.filter((i) => state.decisions[i.product_number]).length;
+  const cands = clusterCandidates(items);
+  const marked = cands.filter((i) => state.decisions[i.product_number]).length;
   const parentTime = formatDuration(liveParentSeconds(cid));
   const done = state.completed.has(cid) ? "DONE" : "in progress";
   $("#topMeta").textContent =
-    `${state.jobName} · Cluster ${state.clusterIndex + 1}/${order.length} · id ${cid} · ${marked}/${items.length} marked · ${done} · time ${parentTime} · ${Object.keys(state.decisions).length} decisions`;
+    `${state.jobName} · Cluster ${state.clusterIndex + 1}/${order.length} · id ${cid} · ${marked}/${cands.length} marked · ${done} · time ${parentTime} · ${Object.keys(state.decisions).length} decisions`;
 }
 
 function renderCluster() {

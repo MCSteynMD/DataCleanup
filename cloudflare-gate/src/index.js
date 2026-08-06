@@ -459,7 +459,7 @@ function appShell() {
     </section>
   </div>
   ${clientLocalStampScript()}
-  <script type="module" src="/app.js?v=24"><\/script>
+  <script type="module" src="/app.js?v=25"><\/script>
 </body>
 </html>`;
 }

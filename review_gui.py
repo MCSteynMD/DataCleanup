@@ -771,19 +771,39 @@ def compute_review_stats(
     *,
     current_cluster_id: int | None = None,
     current_cluster_index: int = 0,
+    clusters: dict[int, list[dict]] | None = None,
 ) -> dict:
     decisions = progress.get("decisions", {})
     completed = set(progress.get("clusters_completed", []))
 
+    # Rebuild cluster membership when caller only passed by_product.
+    if clusters is None:
+        clusters = {}
+        for item in by_product.values():
+            clusters.setdefault(item["cluster_id"], []).append(item)
+
+    parent_pns = set()
+    for cid in cluster_order:
+        root = cluster_root(clusters.get(cid, []))
+        if root:
+            parent_pns.add(root["product_number"])
+
     status_counts: Counter[str] = Counter()
+    reviewed_in_queue = 0
+    review_cids = set(cluster_order)
     for pn, dec in decisions.items():
-        if pn not in by_product:
+        if pn not in by_product or pn in parent_pns:
             continue
         status_counts[normalize_status(dec["status"])] += 1
+        if by_product[pn]["cluster_id"] in review_cids:
+            reviewed_in_queue += 1
 
     reviewed = sum(status_counts.values())
     total = len(by_product)
-    remaining = max(total - reviewed, 0)
+    reviewable = sum(
+        len(cluster_candidates(clusters.get(cid, []))) for cid in cluster_order
+    )
+    remaining = max(reviewable - reviewed_in_queue, 0)
     n_clusters = len(cluster_order)
     n_clusters_done = sum(1 for cid in cluster_order if cid in completed)
 
@@ -798,13 +818,10 @@ def compute_review_stats(
     current_cluster_reviewed = 0
     current_cluster_size = 0
     if current_cluster_id is not None and current_cluster_id in cluster_order:
-        current_cluster_size = sum(
-            1 for item in by_product.values()
-            if item["cluster_id"] == current_cluster_id
-        )
+        cands = cluster_candidates(clusters.get(current_cluster_id, []))
+        current_cluster_size = len(cands)
         current_cluster_reviewed = sum(
-            1 for pn in decisions
-            if pn in by_product and by_product[pn]["cluster_id"] == current_cluster_id
+            1 for item in cands if item["product_number"] in decisions
         )
 
     times = parent_times_dict(progress)
@@ -816,9 +833,11 @@ def compute_review_stats(
 
     return {
         "total": total,
+        "reviewable": reviewable,
         "reviewed": reviewed,
+        "reviewed_in_queue": reviewed_in_queue,
         "remaining": remaining,
-        "reviewed_pct": pct(reviewed, total),
+        "reviewed_pct": pct(reviewed_in_queue, reviewable),
         "n_clusters": n_clusters,
         "n_clusters_done": n_clusters_done,
         "clusters_done_pct": pct(n_clusters_done, n_clusters),
@@ -849,7 +868,7 @@ def format_review_stats(stats: dict) -> str:
         "=" * 40,
         "",
         "Overall progress",
-        f"  Reviewed     {stats['reviewed']:,} / {stats['total']:,}  ({stats['reviewed_pct']:.1f}%)",
+        f"  Reviewed     {stats.get('reviewed_in_queue', stats['reviewed']):,} / {stats.get('reviewable', stats['total']):,}  ({stats['reviewed_pct']:.1f}%)",
         f"  Remaining    {stats['remaining']:,}",
         "",
         "Clusters",
@@ -930,20 +949,22 @@ def build_cluster_report_rows(
     rows: list[dict] = []
     for cid in cluster_order:
         items = clusters.get(cid, [])
+        cands = cluster_candidates(items)
         counts: Counter[str] = Counter()
-        for item in items:
+        for item in cands:
             pn = item["product_number"]
             if pn in decisions:
                 counts[normalize_status(decisions[pn]["status"])] += 1
         marked = sum(counts.values())
         size = len(items)
+        queue_size = len(cands)
         root = cluster_root(items)
         seconds = times.get(str(cid), 0.0)
         rows.append({
             "cluster_id": cid,
             "size": size,
             "marked": marked,
-            "remaining": max(size - marked, 0),
+            "remaining": max(queue_size - marked, 0),
             "duplicate": counts["duplicate"],
             "unique": counts["unique"],
             "discard": counts["discard"],
@@ -1057,6 +1078,13 @@ def cluster_root(items: list[dict]) -> dict | None:
     if not roots:
         return min(items, key=lambda i: i["position_in_cluster"])
     return min(roots, key=lambda i: i["position_in_cluster"])
+
+
+def cluster_candidates(items: list[dict]) -> list[dict]:
+    """Children only — the parent/reference is never marked in the duel queue."""
+    root = cluster_root(items)
+    root_pn = root["product_number"] if root else None
+    return [item for item in items if item["product_number"] != root_pn]
 
 
 class ReportsScreen(QWidget):
@@ -1201,6 +1229,7 @@ class ReportsScreen(QWidget):
             w.progress,
             current_cluster_id=w._current_cluster_id(),
             current_cluster_index=w.cluster_index,
+            clusters=w.clusters,
         )
         self._decision_rows = build_decision_rows(w.by_product, w.progress)
         self._cluster_rows = build_cluster_report_rows(
@@ -1208,7 +1237,7 @@ class ReportsScreen(QWidget):
         )
         s = self._stats
         kpi_texts = [
-            f"Reviewed\n{s['reviewed']:,} / {s['total']:,}\n{s['reviewed_pct']:.1f}%",
+            f"Reviewed\n{s.get('reviewed_in_queue', s['reviewed']):,} / {s.get('reviewable', s['total']):,}\n{s['reviewed_pct']:.1f}%",
             f"Duplicates\n{s['duplicate']:,}\n{s['duplicate_pct_of_total']:.1f}% of all",
             f"Unique\n{s['unique']:,}\n{s['unique_pct_of_reviewed']:.1f}% of reviewed",
             f"Avg / parent\n{format_duration(s['avg_seconds_per_parent'])}\n"
@@ -1338,6 +1367,7 @@ class StatsDialog(QDialog):
             window.progress,
             current_cluster_id=window._current_cluster_id(),
             current_cluster_index=window.cluster_index,
+            clusters=window.clusters,
         )
         self.text.setPlainText(format_review_stats(stats))
 
@@ -2784,14 +2814,13 @@ class ReviewWindow(QMainWindow):
             self.top_strip.set_info("No clusters loaded", "")
             return
         items = self.clusters[cid]
-        reviewed = sum(1 for it in items if it["product_number"] in self.progress["decisions"])
         done = cid in self.progress.get("clusters_completed", [])
         status = "DONE" if done else "in progress"
         marked_cands = sum(1 for pn in self._candidate_order if pn in self.progress["decisions"])
         parent_time = format_duration(self._live_parent_seconds(cid))
         self.top_strip.set_info(
             f"{self.results_path.name}  ·  Cluster {self.cluster_index + 1} / {len(self.cluster_order)}  ·  id {cid}  ·  {status}",
-            f"{reviewed}/{len(items)} marked  ·  queue {marked_cands}/{len(self._candidate_order)}  ·  "
+            f"{marked_cands}/{len(self._candidate_order)} marked  ·  "
             f"all {len(self.progress['decisions']):,}/{len(self.by_product):,}  ·  "
             f"parent {parent_time}",
         )
