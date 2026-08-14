@@ -1,4 +1,4 @@
-import { clusterProducts, tokenDiff } from "./engine.js?v=16";
+import { clusterProducts, tokenDiff, buildPass2Catalog } from "./engine.js?v=17";
 
 /** Parent/reference description for alphabetical cluster ordering. */
 function clusterParentName(clusters, cid) {
@@ -22,6 +22,7 @@ function sortClusterOrderByName(clusterOrder, clusters) {
 const $ = (sel) => document.querySelector(sel);
 const THEME_KEY = "cleanup-dark-mode";
 const state = {
+  pass: 1,
   jobId: null,
   jobName: "",
   catalog: null,
@@ -1228,6 +1229,7 @@ async function deleteJob(id, name = "") {
       updateTop();
     }
     await refreshJobs();
+    if (state.pass === 2) await refreshPass1Sources().catch(() => {});
   } catch (err) {
     console.error(err);
     alert(err.message || String(err));
@@ -1340,6 +1342,7 @@ async function handleFile(file) {
       body: JSON.stringify({
         name: file.name,
         source_kind: kind,
+        pass_number: 1,
         n_products: nProducts,
         n_clusters: catalog.cluster_order.length,
       }),
@@ -1385,16 +1388,21 @@ async function handleFile(file) {
 }
 
 async function refreshJobs() {
-  const { jobs } = await api("/api/jobs");
-  const host = $("#jobList");
+  const pass = state.pass === 2 ? 2 : 1;
+  const { jobs } = await api(`/api/jobs?pass=${pass}`);
+  const host = pass === 2 ? $("#pass2JobList") : $("#jobList");
+  if (!host) return;
   if (!jobs.length) {
-    host.innerHTML = "";
+    host.innerHTML =
+      pass === 2
+        ? `<h2>Pass 2 jobs</h2><p class="hint">None yet — build one from a Pass 1 job above.</p>`
+        : "";
     return;
   }
-  host.innerHTML = `<h2>Saved jobs</h2>${jobs
+  host.innerHTML = `<h2>${pass === 2 ? "Pass 2 jobs" : "Saved jobs"}</h2>${jobs
     .map(
       (j) => `<div class="job-row">
-      <div><strong>${escapeHtml(j.name)}</strong><br/><span class="job-meta">${j.n_clusters} review clusters · ${Number(j.n_products).toLocaleString()} products</span></div>
+      <div><strong>${escapeHtml(j.name)}</strong><br/><span class="job-meta">${j.n_clusters} review clusters · ${Number(j.n_products).toLocaleString()} products${j.source_job_id ? ` · from ${escapeHtml(String(j.source_job_id).slice(0, 8))}…` : ""}</span></div>
       <div class="job-actions">
         <button type="button" class="btn primary" data-open-job="${j.id}">Open</button>
         <button type="button" class="btn danger" data-delete-job="${j.id}" data-delete-name="${escapeHtml(j.name)}">Delete</button>
@@ -1410,6 +1418,163 @@ async function refreshJobs() {
       deleteJob(btn.getAttribute("data-delete-job"), btn.getAttribute("data-delete-name") || "");
     });
   });
+}
+
+async function refreshPass1Sources() {
+  const host = $("#pass1SourceList");
+  if (!host) return;
+  const { jobs } = await api("/api/jobs?pass=1");
+  if (!jobs.length) {
+    host.innerHTML = `<h2>Pass 1 sources</h2><p class="hint">No Pass 1 jobs yet — finish Pass 1 first.</p>`;
+    return;
+  }
+  host.innerHTML = `<h2>Build from Pass 1</h2>${jobs
+    .map(
+      (j) => `<div class="job-row">
+      <div><strong>${escapeHtml(j.name)}</strong><br/><span class="job-meta">${j.n_clusters} clusters · ${Number(j.n_products).toLocaleString()} products</span></div>
+      <div class="job-actions">
+        <button type="button" class="btn primary" data-build-pass2="${j.id}" data-build-name="${escapeHtml(j.name)}">Start Pass 2</button>
+      </div>
+    </div>`,
+    )
+    .join("")}`;
+  host.querySelectorAll("[data-build-pass2]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      startPass2FromJob(
+        btn.getAttribute("data-build-pass2"),
+        btn.getAttribute("data-build-name") || "",
+      ).catch((e) => {
+        setProgress(false);
+        alert(e.message || String(e));
+      });
+    });
+  });
+}
+
+async function startPass2FromJob(sourceJobId, sourceName = "") {
+  setProgress(true, "Loading Pass 1 job…", 8);
+  const data = await api(`/api/jobs/${sourceJobId}`);
+  let catalog = data.catalog;
+  if (!catalog?.by_product || !Object.keys(catalog.by_product).length) {
+    const cached = await idbGet(sourceJobId);
+    if (cached) catalog = applyMoves(cached, data.moves || {});
+  } else {
+    catalog = applyMoves(catalog, data.moves || {});
+  }
+  if (!catalog?.by_product || !Object.keys(catalog.by_product).length) {
+    throw new Error("Pass 1 catalog missing — reopen the Pass 1 job once, then try again.");
+  }
+  const decisions = data.decisions || {};
+
+  setProgress(true, "Building Pass 2 clusters…", 20);
+  const { catalog: pass2Catalog, autoDecisions } = await buildPass2Catalog(
+    catalog,
+    decisions,
+    (msg, pct) => setProgress(true, msg, 20 + pct * 0.55),
+  );
+
+  const nClusters = pass2Catalog.cluster_order.length;
+  if (!nClusters) {
+    throw new Error("No Pass 2 matches found (no child had a near-duplicate in the catalog).");
+  }
+
+  setProgress(true, "Creating Pass 2 job…", 80);
+  const created = await api("/api/jobs", {
+    method: "POST",
+    body: JSON.stringify({
+      name: `Pass2 ← ${sourceName || sourceJobId}`,
+      source_kind: "pass2",
+      pass_number: 2,
+      source_job_id: sourceJobId,
+      n_products: Object.keys(pass2Catalog.by_product).length,
+      n_clusters: nClusters,
+    }),
+  });
+
+  try {
+    await idbSet(created.id, pass2Catalog);
+  } catch (e) {
+    console.warn("IndexedDB cache skipped", e);
+  }
+
+  setProgress(true, "Saving Pass 2 catalog…", 86);
+  try {
+    await uploadCatalogToD1(created.id, pass2Catalog);
+  } catch (err) {
+    console.warn("Cloud product sync failed; using local cache", err);
+    alert(
+      `Cloud sync had a problem (${err.message}).\n\nReview will continue on this browser; decisions still save.`,
+    );
+  }
+
+  const autoItems = Object.entries(autoDecisions).map(([pn, d]) => ({
+    product_number: pn,
+    status: d.status,
+    cluster_id: d.cluster_id,
+    note: d.note || "from_pass1",
+  }));
+  if (autoItems.length) {
+    setProgress(true, `Pre-marking ${autoItems.length.toLocaleString()} Pass 1 duplicates…`, 92);
+    for (let i = 0; i < autoItems.length; i += 400) {
+      await api(`/api/jobs/${created.id}/decisions/batch`, {
+        method: "POST",
+        body: JSON.stringify({ items: autoItems.slice(i, i + 400) }),
+      });
+    }
+  }
+
+  // Mark fully auto-completed clusters as done
+  const completed = [];
+  for (const cid of pass2Catalog.cluster_order) {
+    const members = pass2Catalog.clusters[cid] || [];
+    const root = clusterRoot(members);
+    const cands = members.filter((m) => m.product_number !== root?.product_number);
+    if (cands.length && cands.every((m) => autoDecisions[m.product_number])) {
+      completed.push(cid);
+    }
+  }
+  if (completed.length) {
+    await api(`/api/jobs/${created.id}/progress`, {
+      method: "PUT",
+      body: JSON.stringify({
+        cluster_index: 0,
+        clusters_completed: completed,
+        parent_times: {},
+      }),
+    });
+  }
+
+  state.pass = 2;
+  syncPassTabUi();
+  setProgress(true, "Opening Pass 2…", 98);
+  await openJob(created.id, pass2Catalog);
+  await refreshJobs();
+  setRelatedBanner(
+    `Pass 2 ready · ${nClusters.toLocaleString()} parents · ${autoItems.length.toLocaleString()} duplicates carried from Pass 1`,
+  );
+}
+
+function syncPassTabUi() {
+  document.querySelectorAll("[data-pass-tab]").forEach((btn) => {
+    btn.classList.toggle("active", Number(btn.getAttribute("data-pass-tab")) === state.pass);
+  });
+  const p1 = $("#pass1Upload");
+  const p2 = $("#pass2Upload");
+  if (p1) p1.classList.toggle("hidden", state.pass !== 1);
+  if (p2) p2.classList.toggle("hidden", state.pass !== 2);
+}
+
+function setPass(pass) {
+  state.pass = pass === 2 ? 2 : 1;
+  syncPassTabUi();
+  pauseParentTimer({ persist: true });
+  showScreen("upload");
+  updateTop();
+  if (state.pass === 1) {
+    refreshJobs().catch((e) => console.warn(e));
+  } else {
+    Promise.all([refreshPass1Sources(), refreshJobs()]).catch((e) => console.warn(e));
+  }
 }
 
 async function openJob(id, localCatalog = null) {
@@ -1453,6 +1618,9 @@ async function openJob(id, localCatalog = null) {
     setProgress(true, "Preparing review…", 70);
     state.jobId = id;
     state.jobName = data.job.name;
+    const jobPass = Number(data.job.pass_number) === 2 ? 2 : 1;
+    state.pass = jobPass;
+    syncPassTabUi();
     state.catalog = applyMoves(data.catalog, data.moves || {});
     state.decisions = data.decisions || {};
     state.moves = data.moves || {};
@@ -2103,14 +2271,10 @@ function wireReview() {
   $("#btnClear").addEventListener("click", () => clearMark());
   $("#btnNext").addEventListener("click", () => nextCluster());
   $("#btnPrev").addEventListener("click", () => prevCluster());
-  $("#btnHome").addEventListener("click", () => {
-    pauseParentTimer({ persist: true });
-    showScreen("upload");
-    setProgress(true, "Refreshing jobs…", 40);
-    refreshJobs()
-      .catch((e) => console.warn(e))
-      .finally(() => setProgress(false));
+  document.querySelectorAll("[data-pass-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => setPass(Number(btn.getAttribute("data-pass-tab"))));
   });
+  $(".brand")?.addEventListener("click", () => setPass(state.pass));
   $("#btnReports")?.addEventListener("click", () => showReportsScreen());
   $("#btnTimesheet")?.addEventListener("click", () => showTimesheetScreen());
   $("#btnRelatedRun")?.addEventListener("click", () => {
@@ -2207,6 +2371,7 @@ function wireReview() {
 
 async function boot() {
   initTheme();
+  syncPassTabUi();
   wireUpload();
   wireReview();
   showScreen("upload");

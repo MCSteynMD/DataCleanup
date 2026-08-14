@@ -308,3 +308,255 @@ export function tokenDiff(refText, candText) {
   onlyCand.sort();
   return { shared, onlyRef, onlyCand };
 }
+
+/**
+ * Pass 2: every Pass-1 child becomes a parent, matched (Jaccard ≥ 0.60) against
+ * the full catalog. Returns { catalog, autoDecisions } where autoDecisions
+ * pre-marks any product that was Duplicate in Pass 1.
+ *
+ * @param {{ cluster_order:number[], clusters:Record<number, any[]>, by_product:Record<string, any> }} pass1Catalog
+ * @param {Record<string, {status?:string}>} pass1Decisions
+ * @param {(msg:string, pct:number)=>void} [onProgress]
+ */
+export async function buildPass2Catalog(pass1Catalog, pass1Decisions = {}, onProgress) {
+  const byIn = pass1Catalog?.by_product || {};
+  const all = Object.values(byIn);
+  if (!all.length) throw new Error("Pass 1 catalog is empty");
+
+  const rows = all.map((p) => ({
+    product_number: String(p.product_number),
+    description: p.description || "",
+  }));
+  const pnToIdx = new Map(rows.map((r, i) => [r.product_number, i]));
+
+  // Every non-root member of a Pass-1 review cluster is a Pass-2 parent.
+  const childOrder = [];
+  const childSet = new Set();
+  for (const cid of pass1Catalog.cluster_order || []) {
+    const members = pass1Catalog.clusters?.[cid] || [];
+    if (members.length < 2) continue;
+    const root =
+      members.find((m) => Number(m.depth) === 0) ||
+      members.slice().sort((a, b) => a.position_in_cluster - b.position_in_cluster)[0];
+    const rootPn = root?.product_number;
+    for (const m of members) {
+      const pn = String(m.product_number || "");
+      if (!pn || pn === rootPn || childSet.has(pn)) continue;
+      childSet.add(pn);
+      childOrder.push(pn);
+    }
+  }
+
+  if (!childOrder.length) {
+    throw new Error("No Pass-1 children found — finish Pass 1 clusters first.");
+  }
+
+  if (onProgress) onProgress(`Tokenizing ${rows.length.toLocaleString()} products…`, 5);
+  const tokenSets = new Array(rows.length);
+  for (let i = 0; i < rows.length; i++) {
+    tokenSets[i] = tokenize(rows[i].description).tokens;
+    if (onProgress && i > 0 && i % 2000 === 0) {
+      onProgress(`Tokenizing… ${i.toLocaleString()}/${rows.length.toLocaleString()}`, 5 + (i / rows.length) * 15);
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  const inv = new Map();
+  for (let i = 0; i < rows.length; i++) {
+    for (const t of tokenSets[i]) {
+      let list = inv.get(t);
+      if (!list) {
+        list = [];
+        inv.set(t, list);
+      }
+      if (list.length < MAX_POSTING) list.push(i);
+      else if (list.length === MAX_POSTING) list.push(-1);
+    }
+  }
+
+  const thr = SIMILARITY_THRESHOLD;
+  const pass1Dup = new Set();
+  for (const [pn, dec] of Object.entries(pass1Decisions || {})) {
+    const st = String(dec?.status || "").toLowerCase();
+    if (st === "duplicate" || st === "same") pass1Dup.add(String(pn));
+  }
+
+  // Edges: child → [{j, score}, ...]
+  const edges = new Map();
+  let done = 0;
+  let lastYield = Date.now();
+  if (onProgress) onProgress(`Matching ${childOrder.length.toLocaleString()} children…`, 25);
+
+  for (const childPn of childOrder) {
+    const i = pnToIdx.get(childPn);
+    done += 1;
+    if (i == null) continue;
+    const seen = new Set([i]);
+    const hits = [];
+    for (const t of tokenSets[i]) {
+      const idxs = inv.get(t);
+      if (!idxs || idxs.length < 2) continue;
+      if (idxs[idxs.length - 1] === -1 || idxs.length > MAX_POSTING) continue;
+      for (const j of idxs) {
+        if (seen.has(j)) continue;
+        seen.add(j);
+        const A = tokenSets[i];
+        const B = tokenSets[j];
+        const min = Math.min(A.size, B.size);
+        const max = Math.max(A.size, B.size);
+        if (!max || min / max < thr) continue;
+        const score = jaccard(A, B);
+        if (score >= thr) hits.push({ j, score });
+      }
+    }
+    hits.sort((a, b) => b.score - a.score);
+    if (hits.length) edges.set(childPn, hits);
+    if (onProgress && done % 40 === 0) {
+      onProgress(
+        `Matching children… ${done.toLocaleString()}/${childOrder.length.toLocaleString()}`,
+        25 + (done / childOrder.length) * 55,
+      );
+    }
+    if (Date.now() - lastYield > 60) {
+      lastYield = Date.now();
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  if (onProgress) onProgress("Building Pass 2 clusters…", 85);
+
+  // Assign each non-parent product to at most one Pass-2 parent (best score).
+  // Pass-2 parents may still appear as candidates under other parents (list copies).
+  const bestForCand = new Map(); // candPn -> { childPn, score }
+  for (const [childPn, hits] of edges) {
+    for (const { j, score } of hits) {
+      const candPn = rows[j].product_number;
+      if (childSet.has(candPn)) continue; // other Pass-2 parents handled as list-only copies
+      const cur = bestForCand.get(candPn);
+      if (!cur || score > cur.score) bestForCand.set(candPn, { childPn, score });
+    }
+  }
+
+  const assigned = new Map(); // childPn -> [{ pn, score }]
+  for (const [candPn, { childPn, score }] of bestForCand) {
+    let list = assigned.get(childPn);
+    if (!list) {
+      list = [];
+      assigned.set(childPn, list);
+    }
+    list.push({ pn: candPn, score });
+  }
+
+  // Also attach other Pass-2 parents as candidates under each parent (cross-child matches)
+  for (const [childPn, hits] of edges) {
+    let list = assigned.get(childPn);
+    if (!list) {
+      list = [];
+      assigned.set(childPn, list);
+    }
+    const have = new Set(list.map((x) => x.pn));
+    for (const { j, score } of hits) {
+      const candPn = rows[j].product_number;
+      if (!childSet.has(candPn) || candPn === childPn) continue;
+      if (have.has(candPn)) continue;
+      have.add(candPn);
+      list.push({ pn: candPn, score });
+    }
+  }
+
+  const clusters = {};
+  const byProduct = {};
+  const clusterOrder = [];
+  const autoDecisions = {};
+  let cid = 0;
+
+  for (const childPn of childOrder) {
+    const cands = (assigned.get(childPn) || []).slice().sort((a, b) => b.score - a.score);
+    if (!cands.length) continue;
+
+    const parentRow = byIn[childPn] || { product_number: childPn, description: "" };
+    const items = [
+      {
+        cluster_id: cid,
+        cluster_size: cands.length + 1,
+        position_in_cluster: 0,
+        depth: 0,
+        product_number: childPn,
+        description: parentRow.description || "",
+        linked_to_product: "",
+        score_to_parent: "",
+        n_similar_in_cluster: cands.length,
+        exact_dup_group: "",
+      },
+    ];
+    byProduct[childPn] = items[0];
+
+    cands.forEach((c, pos) => {
+      const src = byIn[c.pn] || { product_number: c.pn, description: "" };
+      const item = {
+        cluster_id: cid,
+        cluster_size: cands.length + 1,
+        position_in_cluster: pos + 1,
+        depth: 1,
+        product_number: c.pn,
+        description: src.description || "",
+        linked_to_product: childPn,
+        score_to_parent: Math.round(c.score * 10000) / 10000,
+        n_similar_in_cluster: cands.length,
+        exact_dup_group: "",
+      };
+      items.push(item);
+      // Prefer parent-role by_product for other Pass-2 parents; else store candidate
+      if (!childSet.has(c.pn) || !byProduct[c.pn]) byProduct[c.pn] = item;
+      if (pass1Dup.has(c.pn) && !autoDecisions[c.pn]) {
+        autoDecisions[c.pn] = {
+          status: "duplicate",
+          cluster_id: cid,
+          note: "from_pass1",
+        };
+      }
+    });
+
+    clusters[cid] = items;
+    clusterOrder.push(cid);
+    cid += 1;
+  }
+
+  // Keep every Pass-1 product in the catalog (singletons for anything unused)
+  for (const p of all) {
+    const pn = String(p.product_number);
+    if (byProduct[pn]) continue;
+    const item = {
+      cluster_id: cid,
+      cluster_size: 1,
+      position_in_cluster: 0,
+      depth: 0,
+      product_number: pn,
+      description: p.description || "",
+      linked_to_product: "",
+      score_to_parent: "",
+      n_similar_in_cluster: 0,
+      exact_dup_group: "",
+    };
+    clusters[cid] = [item];
+    byProduct[pn] = item;
+    cid += 1;
+  }
+
+  if (onProgress) onProgress("Pass 2 ready", 100);
+  return {
+    catalog: {
+      cluster_order: clusterOrder,
+      clusters,
+      by_product: byProduct,
+      semantic: {},
+      stats: {
+        n_products: Object.keys(byProduct).length,
+        n_clusters: clusterOrder.length,
+        n_pass1_children: childOrder.length,
+        n_auto_duplicates: Object.keys(autoDecisions).length,
+      },
+    },
+    autoDecisions,
+  };
+}

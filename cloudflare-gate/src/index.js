@@ -324,7 +324,7 @@ function appShell() {
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/app.css?v=22" />
+  <link rel="stylesheet" href="/app.css?v=23" />
   <script src="/xlsx.full.min.js?v=15"><\/script>
   <script>
     try {
@@ -341,7 +341,6 @@ function appShell() {
       <div class="meta" id="topMeta">Upload a sheet to begin</div>
       <div class="actions">
         <button type="button" class="btn ghost" id="btnTheme" title="Toggle dark mode (T)">Dark</button>
-        <button type="button" class="btn ghost" id="btnHome">Jobs</button>
         <button type="button" class="btn" id="btnReports" title="Reports (R)">Reports</button>
         <button type="button" class="btn" id="btnTimesheet" title="Login / logout timesheet">Timesheet</button>
         <button type="button" class="btn" id="btnRelatedRun" title="Run Related matching on backend">Run Related</button>
@@ -356,10 +355,15 @@ function appShell() {
       </div>
     </header>
 
+    <nav class="pass-tabs" aria-label="Review pass">
+      <button type="button" class="pass-tab active" data-pass-tab="1">Pass 1</button>
+      <button type="button" class="pass-tab" data-pass-tab="2">Pass 2</button>
+    </nav>
+
     <section class="screen active" data-screen="upload">
       <div class="upload-wrap">
-        <div class="upload-card">
-          <h1>Start a cleanup job</h1>
+        <div class="upload-card" id="pass1Upload">
+          <h1>Pass 1 \u2014 start a cleanup job</h1>
           <p>A <strong>job</strong> is one saved review session for a workbook \u2014 every product is kept. Near-duplicates go into the review queue; unmatched products stay in the catalog and on the Excel <strong>Unmatched</strong> sheet. Drop a <strong>similarity results</strong> workbook (Grouped Review) or an <strong>FOExport</strong> sheet. FOExport is clustered in your browser (Jaccard \u2265 0.60); Related (\u2265 0.50) runs on Cloudflare after upload.</p>
           <div class="drop" id="dropZone">Drop .xlsx here or click to choose</div>
           <input id="fileInput" type="file" accept=".xlsx,.xlsm" hidden />
@@ -368,6 +372,12 @@ function appShell() {
             <div class="bar"><span id="uploadBar"></span></div>
           </div>
           <div class="job-list" id="jobList"></div>
+        </div>
+        <div class="upload-card hidden" id="pass2Upload">
+          <h1>Pass 2 \u2014 children as parents</h1>
+          <p>Every <strong>Pass 1 child</strong> becomes a parent and is matched against the <strong>full catalog</strong> (Jaccard \u2265 0.60). Products marked <strong>Duplicate</strong> in Pass 1 are pre-marked here. Pick a finished Pass 1 job to build from (uses that job\u2019s catalog + decisions).</p>
+          <div class="job-list" id="pass1SourceList"></div>
+          <div class="job-list" id="pass2JobList"></div>
         </div>
       </div>
     </section>
@@ -459,7 +469,7 @@ function appShell() {
     </section>
   </div>
   ${clientLocalStampScript()}
-  <script type="module" src="/app.js?v=25"><\/script>
+  <script type="module" src="/app.js?v=26"><\/script>
 </body>
 </html>`;
 }
@@ -595,11 +605,32 @@ async function handleApi(request, env, url, ctx) {
     });
   }
   if (path === "/api/jobs" && request.method === "GET") {
-    const { results } = await env.DB.prepare(
-      `SELECT id, name, source_kind, created_at, updated_at, n_products, n_clusters, cluster_index
-       FROM jobs ORDER BY updated_at DESC LIMIT 50`
-    ).all();
-    return json({ jobs: results || [] });
+    const passRaw = url.searchParams.get("pass");
+    const passNum = passRaw != null && passRaw !== "" ? Number(passRaw) : null;
+    let sql = `SELECT id, name, source_kind, created_at, updated_at, n_products, n_clusters, cluster_index
+                      , COALESCE(pass_number, 1) AS pass_number, source_job_id
+               FROM jobs`;
+    const binds = [];
+    if (Number.isFinite(passNum) && (passNum === 1 || passNum === 2)) {
+      sql += ` WHERE COALESCE(pass_number, 1) = ?`;
+      binds.push(passNum);
+    }
+    sql += ` ORDER BY updated_at DESC LIMIT 50`;
+    let results;
+    try {
+      const q = env.DB.prepare(sql);
+      const out = binds.length ? await q.bind(...binds).all() : await q.all();
+      results = out.results || [];
+    } catch {
+      // Older DBs without pass_number column
+      const { results: legacy } = await env.DB.prepare(
+        `SELECT id, name, source_kind, created_at, updated_at, n_products, n_clusters, cluster_index
+         FROM jobs ORDER BY updated_at DESC LIMIT 50`
+      ).all();
+      results = (legacy || []).map((j) => ({ ...j, pass_number: 1, source_job_id: null }));
+      if (passNum === 2) results = [];
+    }
+    return json({ jobs: results });
   }
   if (path === "/api/jobs" && request.method === "POST") {
     const body = await request.json();
@@ -609,14 +640,23 @@ async function handleApi(request, env, url, ctx) {
     const ts = nowIso2();
     const nProducts = Number(body.n_products) || 0;
     const nClusters = Number(body.n_clusters) || 0;
-    await env.DB.prepare(
-      `INSERT INTO jobs (id, name, source_kind, created_at, updated_at, n_products, n_clusters, cluster_index)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0)`
-    ).bind(id, name, kind, ts, ts, nProducts, nClusters).run();
+    const passNumber = Number(body.pass_number) === 2 ? 2 : 1;
+    const sourceJobId = body.source_job_id ? String(body.source_job_id).slice(0, 64) : null;
+    try {
+      await env.DB.prepare(
+        `INSERT INTO jobs (id, name, source_kind, created_at, updated_at, n_products, n_clusters, cluster_index, pass_number, source_job_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
+      ).bind(id, name, kind, ts, ts, nProducts, nClusters, passNumber, sourceJobId).run();
+    } catch {
+      await env.DB.prepare(
+        `INSERT INTO jobs (id, name, source_kind, created_at, updated_at, n_products, n_clusters, cluster_index)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0)`
+      ).bind(id, name, kind, ts, ts, nProducts, nClusters).run();
+    }
     await env.DB.prepare(
       `INSERT INTO progress (job_id, clusters_completed, parent_times, updated_at) VALUES (?, '[]', '{}', ?)`
     ).bind(id, ts).run();
-    return json({ id });
+    return json({ id, pass_number: passNumber, source_job_id: sourceJobId });
   }
   const jobMatch = path.match(/^\/api\/jobs\/([^/]+)(.*)$/);
   if (!jobMatch) return json({ error: "Not found" }, 404);
@@ -906,6 +946,37 @@ async function handleApi(request, env, url, ctx) {
     ).run();
     await env.DB.prepare(`UPDATE jobs SET updated_at = ? WHERE id = ?`).bind(ts, jobId).run();
     return json({ ok: true });
+  }
+  if (rest === "/decisions/batch" && request.method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (!items.length) return json({ error: "No items" }, 400);
+    if (items.length > 500) return json({ error: "Max 500 decisions per batch" }, 400);
+    const ts = nowIso2();
+    const stmts = [];
+    for (const it of items) {
+      const pn = String(it.product_number || "").trim();
+      const status = String(it.status || "").trim();
+      if (!pn || !status) continue;
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO decisions (job_id, product_number, status, cluster_id, note, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(job_id, product_number) DO UPDATE SET
+             status=excluded.status,
+             cluster_id=excluded.cluster_id,
+             note=excluded.note,
+             updated_at=excluded.updated_at`
+        ).bind(jobId, pn, status, it.cluster_id ?? null, it.note || "", ts)
+      );
+    }
+    if (stmts.length) {
+      stmts.push(
+        env.DB.prepare(`UPDATE jobs SET updated_at = ? WHERE id = ?`).bind(ts, jobId)
+      );
+      await env.DB.batch(stmts);
+    }
+    return json({ ok: true, n: stmts.length ? stmts.length - 1 : 0 });
   }
   if (rest === "/decisions" && request.method === "DELETE") {
     const body = await request.json();

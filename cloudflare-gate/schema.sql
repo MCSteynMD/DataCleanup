@@ -6,7 +6,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   updated_at TEXT NOT NULL,
   n_products INTEGER NOT NULL DEFAULT 0,
   n_clusters INTEGER NOT NULL DEFAULT 0,
-  cluster_index INTEGER NOT NULL DEFAULT 0
+  cluster_index INTEGER NOT NULL DEFAULT 0,
+  pass_number INTEGER NOT NULL DEFAULT 1,
+  source_job_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS decisions (
