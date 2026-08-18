@@ -568,16 +568,37 @@ a { color: var(--teal); }
 }
 .reports-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
   flex-wrap: wrap;
+}
+.reports-title-block {
+  flex: 1;
+  min-width: 200px;
 }
 .reports-head h1 {
   margin: 0;
   font-size: 1.2rem;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  flex: 1;
+}
+.reports-job-line {
+  margin: 4px 0 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--ink);
+}
+.reports-scope {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--paper-deep);
+  background: color-mix(in srgb, var(--accent, #2a6f6a) 12%, var(--surface));
+  font-size: 0.88rem;
+  line-height: 1.35;
+  color: var(--ink);
+}
+.reports-scope strong {
+  font-weight: 700;
 }
 .reports-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .ts-range {

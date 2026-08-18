@@ -544,15 +544,21 @@ export async function buildPass2Catalog(pass1Catalog, pass1Decisions = {}, onPro
   }
 
   if (onProgress) onProgress("Pass 2 ready", 100);
+  // Same A→Z parent-name queue order as Pass 1
+  const reviewOrder = clusterOrder.slice().sort((a, b) => {
+    const na = String(clusters[a]?.[0]?.description || "").trim().toLocaleLowerCase();
+    const nb = String(clusters[b]?.[0]?.description || "").trim().toLocaleLowerCase();
+    return na.localeCompare(nb) || a - b;
+  });
   return {
     catalog: {
-      cluster_order: clusterOrder,
+      cluster_order: reviewOrder,
       clusters,
       by_product: byProduct,
       semantic: {},
       stats: {
         n_products: Object.keys(byProduct).length,
-        n_clusters: clusterOrder.length,
+        n_clusters: reviewOrder.length,
         n_pass1_children: childOrder.length,
         n_auto_duplicates: Object.keys(autoDecisions).length,
       },

@@ -1,4 +1,4 @@
-import { clusterProducts, tokenDiff, buildPass2Catalog } from "./engine.js?v=17";
+import { clusterProducts, tokenDiff, buildPass2Catalog } from "./engine.js?v=18";
 
 /** Parent/reference description for alphabetical cluster ordering. */
 function clusterParentName(clusters, cid) {
@@ -325,10 +325,36 @@ function computeReviewStats() {
   };
 }
 
+function currentJobPassLabel() {
+  const pass = Number(state.pass) === 2 ? 2 : 1;
+  return `Pass ${pass}`;
+}
+
+function currentJobReportMeta() {
+  const passLabel = currentJobPassLabel();
+  const name = state.jobName || "Untitled job";
+  const id = state.jobId || "";
+  return {
+    pass: Number(state.pass) === 2 ? 2 : 1,
+    passLabel,
+    name,
+    id,
+    shortId: id ? `${String(id).slice(0, 8)}…` : "",
+    title: `${passLabel} · ${name}`,
+  };
+}
+
 function formatReviewStats(stats) {
+  const job = currentJobReportMeta();
   const lines = [
     "REVIEW STATISTICS",
     "=".repeat(40),
+    "",
+    "Job scope (this report only)",
+    `  Pass               ${job.passLabel}`,
+    `  Job name           ${job.name}`,
+    `  Job id             ${job.id || "—"}`,
+    "  Scope              Open job only — other passes/jobs excluded",
     "",
     "Catalog",
     `  Products total     ${stats.total.toLocaleString()}`,
@@ -405,22 +431,15 @@ function buildDecisionRows() {
 }
 
 function buildClusterReportRows() {
+  // Review queue only for the open job — do not dump singleton / unmatched clusters.
   const order = state.catalog?.cluster_order || [];
-  const reviewSet = new Set(order);
   const clusters = state.catalog?.clusters || {};
   const decisions = state.decisions || {};
   const times = parentTimesNormalized();
   if (state.timerClusterId != null && state.timerStartedAt != null) {
     times[String(state.timerClusterId)] = liveParentSeconds(state.timerClusterId);
   }
-  const allIds = [
-    ...order,
-    ...Object.keys(clusters)
-      .map(Number)
-      .filter((cid) => Number.isFinite(cid) && !reviewSet.has(cid))
-      .sort((a, b) => a - b),
-  ];
-  return allIds.map((cid) => {
+  return order.map((cid) => {
     const items = clusters[cid] || [];
     const root = clusterRoot(items);
     const cands = clusterCandidates(items);
@@ -434,7 +453,6 @@ function buildClusterReportRows() {
     const marked = counts.duplicate + counts.unique + counts.discard;
     const queueSize = cands.length;
     const seconds = times[String(cid)] || 0;
-    const singleton = items.length <= 1;
     return {
       cluster_id: cid,
       size: items.length,
@@ -443,11 +461,11 @@ function buildClusterReportRows() {
       duplicate: counts.duplicate,
       unique: counts.unique,
       discard: counts.discard,
-      completed: singleton ? true : state.completed.has(cid),
+      completed: state.completed.has(cid),
       reference: root?.product_number || "",
       time_seconds: seconds,
       time_label: seconds ? formatDuration(seconds) : "—",
-      unmatched: singleton,
+      unmatched: false,
     };
   });
 }
@@ -559,9 +577,29 @@ function renderReports() {
   const stats = computeReviewStats();
   const decisionRows = buildDecisionRows();
   const clusterRows = buildClusterReportRows();
+  const job = currentJobReportMeta();
+
+  const title = $("#reportsTitle");
+  if (title) title.textContent = `Reports · ${job.passLabel}`;
+  const jobLine = $("#reportsJobLine");
+  if (jobLine) {
+    jobLine.textContent = job.name;
+  }
+  const scope = $("#reportsScope");
+  if (scope) {
+    scope.innerHTML = `<strong>Showing ${escapeHtml(job.passLabel)} only</strong> — job <strong>${escapeHtml(job.name)}</strong>${
+      job.shortId ? ` <span class="hint">(${escapeHtml(job.shortId)})</span>` : ""
+    }. Figures and Excel export include this open job’s review queue and decisions — not other passes or jobs.`;
+  }
+  const dupHeading = $("#reportsDupHeading");
+  if (dupHeading) dupHeading.textContent = `Duplicates marked · ${job.passLabel}`;
+  const clusterHeading = $("#reportsClusterHeading");
+  if (clusterHeading) clusterHeading.textContent = `Cluster progress · ${job.passLabel}`;
+
   const kpis = $("#reportsKpis");
   if (kpis) {
     kpis.innerHTML = [
+      `<div class="kpi"><strong>${escapeHtml(job.passLabel)}</strong><div>${escapeHtml(job.name)}</div><span>this job only · id ${escapeHtml(job.shortId || "—")}</span></div>`,
       `<div class="kpi"><strong>Catalog</strong><div>${stats.total.toLocaleString()}</div><span>${stats.reviewable.toLocaleString()} in queue · ${stats.unmatched.toLocaleString()} unmatched kept</span></div>`,
       `<div class="kpi"><strong>Queue reviewed</strong><div>${stats.reviewed_in_queue.toLocaleString()} / ${stats.reviewable.toLocaleString()}</div><span>${stats.reviewed_pct.toFixed(1)}% · ${stats.remaining.toLocaleString()} left</span></div>`,
       `<div class="kpi"><strong>Duplicates</strong><div>${stats.duplicate.toLocaleString()}</div><span>${stats.duplicate_pct_of_total.toFixed(1)}% of all</span></div>`,
@@ -584,7 +622,7 @@ function renderReports() {
         <td>${escapeHtml(r.updated_at)}</td>
       </tr>`,
       )
-      .join("") || `<tr><td colspan="5" class="empty">No duplicates marked yet.</td></tr>`;
+      .join("") || `<tr><td colspan="5" class="empty">No duplicates marked yet for this job.</td></tr>`;
   }
 
   const clusterBody = $("#reportsClusterTable tbody");
@@ -602,7 +640,7 @@ function renderReports() {
         <td>${escapeHtml(r.time_label)}</td>
       </tr>`,
       )
-      .join("") || `<tr><td colspan="8" class="empty">No clusters.</td></tr>`;
+      .join("") || `<tr><td colspan="8" class="empty">No clusters in this job’s review queue.</td></tr>`;
   }
 }
 
@@ -616,8 +654,13 @@ function exportManagementExcel() {
   const decisionRows = buildDecisionRows();
   const clusterRows = buildClusterReportRows();
   const wb = XLSX.utils.book_new();
+  const job = currentJobReportMeta();
   const summaryRows = [
     ["Metric", "Value"],
+    ["Pass", job.passLabel],
+    ["Job name", job.name],
+    ["Job id", job.id],
+    ["Report scope", "This open job only (other passes/jobs excluded)"],
     ["Source file", stats.source_file || ""],
     ["Report generated (UTC)", new Date().toISOString()],
     ["Last progress save", stats.updated_at || ""],
@@ -723,7 +766,11 @@ function exportManagementExcel() {
     "Cluster Progress",
   );
   const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "").slice(0, 12);
-  XLSX.writeFile(wb, `similarity_report_${stamp}.xlsx`);
+  const jobSlug = String(state.jobName || state.jobId || "job")
+    .replace(/[^\w.\-]+/g, "_")
+    .slice(0, 60);
+  const passSlug = `pass${job.pass}`;
+  XLSX.writeFile(wb, `similarity_report_${passSlug}_${jobSlug}_${stamp}.xlsx`);
 }
 
 function clusterRoot(items) {
@@ -2047,6 +2094,71 @@ async function prevCluster() {
   renderCluster();
 }
 
+/** True when every child in the review queue for this parent is marked. */
+function clusterQueueFullyMarked(cid) {
+  const cands = clusterCandidates(state.catalog?.clusters?.[cid] || []);
+  if (!cands.length) return true;
+  return cands.every((c) => Boolean(state.decisions[c.product_number]));
+}
+
+/**
+ * Jump to the work frontier: first open parent after ≥4 consecutive fully
+ * marked parents (Pass 1 + Pass 2). Falls back to first incomplete after the
+ * last fully marked cluster, then first incomplete in the queue.
+ */
+async function jumpToLastReview() {
+  const order = state.catalog?.cluster_order || [];
+  if (!order.length) {
+    alert("No review queue loaded.");
+    return;
+  }
+
+  let streak = 0;
+  let targetIdx = -1;
+  for (let i = 0; i < order.length; i++) {
+    if (clusterQueueFullyMarked(order[i])) {
+      streak += 1;
+      continue;
+    }
+    if (streak >= 4) {
+      targetIdx = i;
+      break;
+    }
+    streak = 0;
+  }
+
+  if (targetIdx < 0) {
+    let lastDone = -1;
+    for (let i = 0; i < order.length; i++) {
+      if (clusterQueueFullyMarked(order[i])) lastDone = i;
+    }
+    if (lastDone >= 0) {
+      for (let i = lastDone + 1; i < order.length; i++) {
+        if (!clusterQueueFullyMarked(order[i])) {
+          targetIdx = i;
+          break;
+        }
+      }
+    }
+  }
+
+  if (targetIdx < 0) {
+    targetIdx = order.findIndex((cid) => !clusterQueueFullyMarked(cid));
+  }
+
+  if (targetIdx < 0) {
+    alert("All parents in this job’s queue look fully marked.");
+    return;
+  }
+
+  pauseParentTimer({ persist: false });
+  state.clusterIndex = targetIdx;
+  state.selected = "";
+  await persistProgress();
+  resumeParentTimer();
+  renderCluster();
+}
+
 function escapeHtml(s) {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -2158,6 +2270,9 @@ function isReviewShortcut(e) {
   if ((key === "g" || key === "G") && !e.ctrlKey && !e.metaKey && !e.altKey) {
     return true;
   }
+  if ((key === "l" || key === "L") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    return true;
+  }
   if ((key === "t" || key === "T") && !e.ctrlKey && !e.metaKey && !e.altKey) {
     return true;
   }
@@ -2212,6 +2327,8 @@ function onKey(e) {
     else nextCluster();
   } else if (e.key === "g" || e.key === "G") {
     $("#relatedPanel").classList.toggle("hidden");
+  } else if (e.key === "l" || e.key === "L") {
+    jumpToLastReview().catch((err) => alert(err.message || String(err)));
   } else if (e.key === "t" || e.key === "T") {
     toggleTheme();
   } else if (e.key === "r" || e.key === "R" || e.key === "s" || e.key === "S") {
@@ -2271,6 +2388,9 @@ function wireReview() {
   $("#btnClear").addEventListener("click", () => clearMark());
   $("#btnNext").addEventListener("click", () => nextCluster());
   $("#btnPrev").addEventListener("click", () => prevCluster());
+  $("#btnLastReview")?.addEventListener("click", () => {
+    jumpToLastReview().catch((err) => alert(err.message || String(err)));
+  });
   document.querySelectorAll("[data-pass-tab]").forEach((btn) => {
     btn.addEventListener("click", () => setPass(Number(btn.getAttribute("data-pass-tab"))));
   });

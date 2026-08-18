@@ -394,7 +394,8 @@ function appShell() {
             <button type="button" class="btn" id="btnClear">Unreview \u2193</button>
             <button type="button" class="btn" id="btnPrev">Prev parent</button>
             <button type="button" class="btn" id="btnNext">Next parent</button>
-            <div class="help">Alt+\u2193 = next child \xB7 Ctrl+Alt+\u2193 = prev child \xB7 Space = next parent \xB7 \u2190 dup \xB7 \u2192 unique \xB7 G = Related \xB7 R = Reports \xB7 T = dark \xB7 Focus mode locks keys</div>
+            <button type="button" class="btn" id="btnLastReview" title="Jump to the next open parent after 4 reviewed ones (L)">Last review</button>
+            <div class="help">Alt+\u2193 = next child \xB7 Ctrl+Alt+\u2193 = prev child \xB7 Space = next parent \xB7 L = last review \xB7 \u2190 dup \xB7 \u2192 unique \xB7 G = Related \xB7 R = Reports \xB7 T = dark \xB7 Focus mode locks keys</div>
           </div>
         </div>
         <aside class="related" id="relatedPanel"><h3>Related</h3></aside>
@@ -404,18 +405,22 @@ function appShell() {
     <section class="screen" data-screen="reports">
       <div class="reports-wrap">
         <div class="reports-head">
-          <h1>Reports</h1>
+          <div class="reports-title-block">
+            <h1 id="reportsTitle">Reports</h1>
+            <p class="reports-job-line" id="reportsJobLine"></p>
+          </div>
           <div class="reports-actions">
             <button type="button" class="btn" id="btnReportsRefresh">Refresh</button>
             <button type="button" class="btn primary" id="btnReportsExcel">Export Excel\u2026</button>
             <button type="button" class="btn" id="btnReportsBack">\u2190 Back to review</button>
           </div>
         </div>
+        <div class="reports-scope" id="reportsScope" role="status"></div>
         <div class="kpi-row" id="reportsKpis"></div>
         <pre class="reports-summary" id="reportsSummary"></pre>
         <div class="reports-split">
           <div>
-            <h2>Duplicates marked</h2>
+            <h2 id="reportsDupHeading">Duplicates marked</h2>
             <div class="table-scroll">
               <table class="report-table" id="reportsDupTable">
                 <thead><tr><th>Product</th><th>Cluster</th><th>Linked to</th><th>Score</th><th>Updated</th></tr></thead>
@@ -424,7 +429,7 @@ function appShell() {
             </div>
           </div>
           <div>
-            <h2>Cluster progress</h2>
+            <h2 id="reportsClusterHeading">Cluster progress</h2>
             <div class="table-scroll">
               <table class="report-table" id="reportsClusterTable">
                 <thead><tr><th>Cluster</th><th>Reference</th><th>Size</th><th>Marked</th><th>Dup</th><th>Unique</th><th>Done</th><th>Time</th></tr></thead>
@@ -469,7 +474,7 @@ function appShell() {
     </section>
   </div>
   ${clientLocalStampScript()}
-  <script type="module" src="/app.js?v=26"><\/script>
+  <script type="module" src="/app.js?v=29"><\/script>
 </body>
 </html>`;
 }
