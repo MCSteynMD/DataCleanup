@@ -1,4 +1,6 @@
 /** Client-side tokenize + Jaccard clustering (mirrors desktop text_normalize / similarity). */
+import { scorePass4Product } from "./naming.js?v=3";
+export { scorePass4Product };
 
 const SPLIT_RE = /[\s/_\-]+/;
 const DIM_RE = /^([A-Z]*)(\d+(?:\.\d+)?)[X×](\d+(?:\.\d+)?)([A-Z]*)$/i;
@@ -561,6 +563,448 @@ export async function buildPass2Catalog(pass1Catalog, pass1Decisions = {}, onPro
         n_clusters: reviewOrder.length,
         n_pass1_children: childOrder.length,
         n_auto_duplicates: Object.keys(autoDecisions).length,
+      },
+    },
+    autoDecisions,
+  };
+}
+
+const P3_STOP = new Set(["THE", "AND", "W", "WITH", "FOR", "OF", "A", "AN", "X"]);
+const P3_SIZE_WORDS = new Set([
+  "XXS", "XS", "XL", "XXL", "XXXL", "XXXXL", "XXXXXL",
+  "SMALL", "MEDIUM", "LARGE",
+]);
+const P3_UNITS =
+  /(?:\d+(?:\.\d+)?)\s*(?:MM|CM|MT\b|IN\b|FT\b|KG|G\b|L\b|ML|TON|KW|NPT|BSP)|(?:\bM\d{1,3}(?:X\d+(?:\.\d+)?)?\b)|(?:\d+\/\d+\s*"?)|(?:\d+\s*")/i;
+const P3_DRAW = /\b[A-Z]{1,8}-?\d{2,}[A-Z0-9\-]*\b|\b\d{6,}\b/;
+const P3_OFFICE = new Set([
+  "HELMET", "BROOM", "FRIDGE", "KETTLE", "MICROWAVE", "PILLOW", "STAPLER",
+  "HIGHLIGHTER", "CALCULATOR", "LANTERN", "LIFEJACKET", "SUNBLOCK", "SHOVEL",
+  "PICKAXE", "WHEELBARROW", "CHAIR", "BOOK", "BANNER", "STAINSHIELD", "OXYGEN",
+  "ACETELEEN", "FOOD", "FUEL",
+]);
+const P3_COMMODITY = new Set([
+  "FILTER", "WIPER", "GUSSET", "NUT", "BOLT", "WASHER", "SEAL", "GASKET",
+  "HOSE", "VALVE", "BEARING", "CLAMP", "SPRING", "BUSH", "SCREW", "PIPE",
+  "TAPE", "PLUG", "CAP", "COUPLING", "FITTING", "NIPPLE", "ELBOW", "SHIM",
+]);
+/** Required facet: size (mm / garment / thread) or code (drawing / SKU). */
+const P3_NEED = {
+  BOLT: "size", NUT: "size", WASHER: "size", SCREW: "size",
+  HOSE: "size", PIPE: "size", TUBE: "size", TAPE: "size",
+  SHIRT: "size", PANTS: "size", JACKET: "size", GLOVES: "size",
+  SPANNER: "size", WRENCH: "size",
+  BEARING: "code", FILTER: "code", VALVE: "code", GASKET: "size",
+  SEAL: "size", INSERT: "code", SWITCH: "code",
+};
+const P3_SEEDS = {
+  TAPE: {
+    good: [
+      "TAPE, RED HONEYCOMB REFLECTIVE, 48MMX50M, JT-RT-LR-SA48-50-H",
+      "CABLE TIE, STAINLESS STEEL, BALL TIE, 362 X 8MM, 107 PER BAG",
+    ],
+    bad: ["TAPE, CLEAR", "TAPE, INSULATION", "TAPE, MATERIAL", "TAPE, DANGER, BARRIER"],
+  },
+  BEARING: {
+    good: ["BEARING, 6305-2RS1, SKF", "WHEEL BEARING, GD6, RIGHT HAND"],
+    bad: ["BEARING", "BEARING, HANGER, DD, BQ"],
+  },
+  BOLT: {
+    good: ["HEX BOLT, M16 X 50, GR8.8, DIN 933", "SOCKET BOLT, M3 X 10, GR8.8"],
+    bad: ["BOLT", "SCREW PLUG"],
+  },
+  HOSE: {
+    good: ["HOSE, HYD, 1/4\", 4SP, S4SP04, DYNAMISCHE PREMIUM"],
+    bad: ["HOSE, RUBBER", "AIRCON HOSE"],
+  },
+  SHIRT: {
+    good: ["SHIRT, TWO TONE, REFLECTIVE, FRONT AND BACK, SIZE XL, JONSSON"],
+    bad: ["SHIRT, SHORT SLEEVE", "SHIRT, BLUE"],
+  },
+  FILTER: {
+    good: ["FILTER, HYDRAULIC, DF BN/HC 240 T E 10 B 1.1/-B6, HYDAC"],
+    bad: ["FILTER", "FILTER, BREATHER, DD"],
+  },
+  WASHER: {
+    good: ["WASHER, M12 GALV, LM90 HT", "WASHER, SPRING, M22"],
+    bad: ["WASHER", "WASHER, WHITE PLASTIC"],
+  },
+  VALVE: {
+    good: ["VALVE, CHECK, S 25 A15-1X/420J3, R901454080"],
+    bad: ["CHECK VALVE", "VALVE, FOOT, START BAR"],
+  },
+};
+
+function p3Tokens(text) {
+  return normalizeTokens(text).filter((t) => t && !P3_STOP.has(t));
+}
+
+function p3Family(text) {
+  const t = p3Tokens(text);
+  return t[0] || "";
+}
+
+function p3Features(pn, text) {
+  const raw = String(text || "");
+  const upper = raw.toUpperCase();
+  const toks = p3Tokens(raw);
+  return {
+    nTok: toks.length,
+    hasNum: /\d/.test(raw),
+    hasUnit: P3_UNITS.test(raw),
+    hasDraw: P3_DRAW.test(upper),
+    hasSizeWord: toks.some((t) => P3_SIZE_WORDS.has(t)),
+    dryrun: upper.includes("DRYRUN"),
+    noUsar: upper.includes("NO USAR"),
+    sCode: /^S/i.test(String(pn || "").trim()),
+    empty: !raw.trim(),
+    toks,
+    family: toks[0] || "",
+  };
+}
+
+function p3Vec(toks) {
+  const c = new Map();
+  for (const t of toks) c.set(t, (c.get(t) || 0) + 1);
+  let n = 0;
+  for (const v of c.values()) n += v * v;
+  return { c, n: Math.sqrt(n) || 1 };
+}
+
+function p3Cos(a, b) {
+  let inter = 0;
+  for (const [k, v] of a.c) {
+    const u = b.c.get(k);
+    if (u) inter += v * u;
+  }
+  return inter / (a.n * b.n);
+}
+
+function p3Centroid(descList) {
+  const c = new Map();
+  for (const d of descList) {
+    for (const t of p3Tokens(d)) c.set(t, (c.get(t) || 0) + 1);
+  }
+  let n = 0;
+  for (const v of c.values()) n += v * v;
+  return { c, n: Math.sqrt(n) || 1 };
+}
+
+function p3HasFacet(feat, need) {
+  if (need === "size") return feat.hasNum || feat.hasUnit || feat.hasSizeWord;
+  if (need === "code") return feat.hasDraw || feat.hasNum;
+  return feat.hasNum || feat.hasDraw;
+}
+
+function p3FamilyProto(family, familyPeers = [], seeds = null) {
+  const seed = seeds || P3_SEEDS[family] || { good: [], bad: [] };
+  const peerDescs = (familyPeers || []).map((p) => p.description || p);
+  const richPeers = peerDescs.filter((d) => {
+    const f = p3Features("", d);
+    return f.nTok >= 6 && f.hasNum;
+  });
+  const thinPeers = peerDescs.filter((d) => {
+    const f = p3Features("", d);
+    return f.nTok <= 3 && !f.hasDraw;
+  });
+  const goodList = [...seed.good, ...richPeers.slice(0, 8)];
+  const badList = [...seed.bad, ...thinPeers.slice(0, 8)];
+  return {
+    goodList,
+    badList,
+    goodC: goodList.length ? p3Centroid(goodList) : null,
+    badC: badList.length ? p3Centroid(badList) : null,
+    familyRich: peerDescs.length >= 12 ? richPeers.length / peerDescs.length : 0,
+  };
+}
+
+/**
+ * Lightweight prototype scorer: hard rules, then family good/bad examples
+ * plus completeness features. verdict: discard | ok | review.
+ */
+export function scorePass3Product(pn, description, familyPeers = [], seeds = null, proto = null) {
+  const feat = p3Features(pn, description);
+  const family = feat.family;
+  const need = P3_NEED[family] || null;
+  const pack = proto || p3FamilyProto(family, familyPeers, seeds);
+  const { goodList, badList, familyRich } = pack;
+  let margin = 0;
+  if (pack.goodC && pack.badC) {
+    const v = p3Vec(feat.toks);
+    margin = p3Cos(v, pack.goodC) - p3Cos(v, pack.badC);
+  }
+  const missing = [];
+  if (need && !p3HasFacet(feat, need)) missing.push(need);
+  if (feat.nTok <= 2 && !feat.hasDraw) missing.push("detail");
+
+  if (feat.sCode) {
+    return { verdict: "discard", status: "discard", note: "auto: service_code", family, feat, margin, missing, reason: "Service / GL code (starts with S)" };
+  }
+  if (feat.empty) {
+    return { verdict: "discard", status: "discard", note: "auto: empty", family, feat, margin, missing, reason: "Empty description" };
+  }
+  if (feat.dryrun || feat.noUsar) {
+    return { verdict: "discard", status: "discard", note: "auto: DRYRUN- reference", family, feat, margin, missing, reason: feat.noUsar ? "NO USAR" : "DRYRUN reference" };
+  }
+  if (P3_OFFICE.has(family) && feat.nTok >= 1) {
+    return { verdict: "ok", status: "ok", note: "auto: office_ok", family, feat, margin, missing, reason: "Short office / PPE name — enough for this family" };
+  }
+  if (feat.nTok <= 1 && P3_COMMODITY.has(family)) {
+    return { verdict: "insufficient", status: "insufficient", note: "auto: one_word", family, feat, margin, missing, reason: "One-word commodity — not enough to identify" };
+  }
+
+  const specified = feat.nTok >= 6 && feat.hasNum && (feat.hasUnit || feat.hasDraw || feat.hasSizeWord);
+  const longSpec = feat.nTok >= 8 && feat.hasNum;
+  const clearlySpecified = feat.hasNum && (feat.hasUnit || feat.hasDraw || feat.hasSizeWord);
+  if ((specified || longSpec || clearlySpecified) && margin >= -0.12 && !(need === "code" && !feat.hasDraw && feat.nTok <= 2)) {
+    return { verdict: "ok", status: "ok", note: "auto: complete", family, feat, margin, missing, reason: "Size/code present" };
+  }
+
+  const peerThin = pack.familyRich >= 0.45 && feat.nTok <= 4 && !feat.hasDraw && !feat.hasUnit && !feat.hasNum;
+  const closerToBad = badList.length >= 3 && margin < -0.08 && !clearlySpecified;
+  const missingFacet = Boolean(need) && !p3HasFacet(feat, need);
+  const shortVague = feat.nTok <= 3 && !feat.hasDraw && !feat.hasNum && !feat.hasUnit;
+
+  if (peerThin || closerToBad || missingFacet || shortVague) {
+    const bits = [];
+    if (missingFacet) bits.push(`missing ${need}`);
+    if (peerThin) bits.push("thinner than most in this family");
+    if (closerToBad) bits.push("closer to thin examples");
+    if (feat.nTok <= 3) bits.push("short name");
+    return {
+      verdict: "review",
+      status: "",
+      note: "",
+      family,
+      feat,
+      margin,
+      missing,
+      reason: bits.join(" · ") || "Needs a human look",
+      goodPeers: goodList.slice(0, 3),
+      badPeers: badList.slice(0, 3),
+    };
+  }
+
+  return { verdict: "ok", status: "ok", note: "auto: complete", family, feat, margin, missing, reason: "Enough information vs family peers" };
+}
+
+/**
+ * Pass 3: completeness. Keepers (not Duplicate/Discard in the source job)
+ * are scored. Hard discards and clear-OK are pre-marked; the review queue
+ * is the grey zone (one product per cluster).
+ */
+export async function buildPass3Catalog(sourceCatalog, sourceDecisions = {}, onProgress) {
+  const byIn = sourceCatalog?.by_product || {};
+  const all = Object.values(byIn);
+  if (!all.length) throw new Error("Source catalog is empty");
+
+  const dropped = new Set();
+  for (const [pn, dec] of Object.entries(sourceDecisions || {})) {
+    const st = String(dec?.status || "").toLowerCase();
+    if (st === "duplicate" || st === "same" || st === "discard") dropped.add(String(pn));
+  }
+
+  const keepers = all.filter((p) => !dropped.has(String(p.product_number)));
+  if (!keepers.length) throw new Error("No keepers left after Pass 1/2 Duplicate and Discard.");
+
+  if (onProgress) onProgress(`Scoring ${keepers.length.toLocaleString()} keepers…`, 8);
+
+  const byFam = new Map();
+  for (const p of keepers) {
+    const fam = p3Family(p.description || "") || "_";
+    let list = byFam.get(fam);
+    if (!list) {
+      list = [];
+      byFam.set(fam, list);
+    }
+    list.push(p);
+  }
+
+  const famProto = new Map();
+  for (const [fam, peers] of byFam) {
+    famProto.set(fam, p3FamilyProto(fam, peers));
+  }
+
+  const autoDecisions = {};
+  const review = [];
+  let done = 0;
+  for (const p of keepers) {
+    done += 1;
+    const fam = p3Family(p.description || "") || "_";
+    const peers = byFam.get(fam) || [];
+    const scored = scorePass3Product(p.product_number, p.description || "", peers, null, famProto.get(fam));
+    const row = { p, scored };
+    if (scored.verdict === "review") review.push(row);
+    else {
+      autoDecisions[String(p.product_number)] = {
+        status: scored.status,
+        note: scored.note,
+        reason: scored.reason,
+      };
+    }
+    if (onProgress && done % 400 === 0) {
+      onProgress(`Scoring… ${done.toLocaleString()}/${keepers.length.toLocaleString()}`, 8 + (done / keepers.length) * 70);
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  review.sort((a, b) => {
+    const na = String(a.p.description || "").trim().toLocaleLowerCase();
+    const nb = String(b.p.description || "").trim().toLocaleLowerCase();
+    return na.localeCompare(nb) || String(a.p.product_number).localeCompare(String(b.p.product_number));
+  });
+
+  if (onProgress) onProgress("Building Pass 3 queue…", 88);
+
+  const clusters = {};
+  const byProduct = {};
+  const clusterOrder = [];
+  let cid = 0;
+
+  function emit(p, size, inQueue) {
+    const item = {
+      cluster_id: cid,
+      cluster_size: size,
+      position_in_cluster: 0,
+      depth: 0,
+      product_number: String(p.product_number),
+      description: p.description || "",
+      linked_to_product: "",
+      score_to_parent: "",
+      n_similar_in_cluster: 0,
+      exact_dup_group: "",
+    };
+    clusters[cid] = [item];
+    byProduct[item.product_number] = item;
+    if (inQueue) clusterOrder.push(cid);
+    cid += 1;
+  }
+
+  for (const { p } of review) emit(p, 1, true);
+  for (const p of keepers) {
+    const pn = String(p.product_number);
+    if (byProduct[pn]) continue;
+    emit(p, 1, false);
+  }
+
+  if (onProgress) onProgress("Pass 3 ready", 100);
+  return {
+    catalog: {
+      cluster_order: clusterOrder,
+      clusters,
+      by_product: byProduct,
+      semantic: {},
+      stats: {
+        n_products: Object.keys(byProduct).length,
+        n_clusters: clusterOrder.length,
+        n_keepers: keepers.length,
+        n_auto_ok: Object.values(autoDecisions).filter((d) => d.status === "ok").length,
+        n_auto_discard: Object.values(autoDecisions).filter((d) => d.status === "discard").length,
+        n_auto_insufficient: Object.values(autoDecisions).filter((d) => d.status === "insufficient").length,
+        n_review: review.length,
+      },
+    },
+    autoDecisions,
+  };
+}
+
+function p4IsDropStatus(st) {
+  const s = String(st || "").toLowerCase();
+  return s === "duplicate" || s === "same" || s === "discard" || s === "insufficient" || s === "thin";
+}
+
+/**
+ * Pass 4 catalog: Pass 3 keepers minus Duplicate / Discard / Insufficient.
+ * Auto-standard and auto-rewrite are pre-marked; queue is the grey zone.
+ */
+export async function buildPass4Catalog(sourceCatalog, sourceDecisions = {}, onProgress) {
+  const byIn = sourceCatalog?.by_product || {};
+  const all = Object.values(byIn);
+  if (!all.length) throw new Error("Source catalog is empty");
+
+  const dropped = new Set();
+  for (const [pn, dec] of Object.entries(sourceDecisions || {})) {
+    if (p4IsDropStatus(dec?.status)) dropped.add(String(pn));
+  }
+  const keepers = all.filter((p) => !dropped.has(String(p.product_number)));
+  if (!keepers.length) throw new Error("No keepers left after Pass 3 Duplicate / Discard / Insufficient.");
+
+  if (onProgress) onProgress(`Scoring ${keepers.length.toLocaleString()} names…`, 10);
+
+  const autoDecisions = {};
+  const review = [];
+  let done = 0;
+  for (const p of keepers) {
+    done += 1;
+    const scored = scorePass4Product(p.product_number, p.description || "");
+    if (scored.verdict === "review") review.push({ p, scored });
+    else {
+      autoDecisions[String(p.product_number)] = {
+        status: scored.status,
+        note: scored.note,
+        reason: scored.reason,
+        proposal: scored.proposal,
+      };
+    }
+    if (onProgress && done % 400 === 0) {
+      onProgress(`Scoring… ${done.toLocaleString()}/${keepers.length.toLocaleString()}`, 10 + (done / keepers.length) * 70);
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  review.sort((a, b) => {
+    const na = String(a.p.description || "").trim().toLocaleLowerCase();
+    const nb = String(b.p.description || "").trim().toLocaleLowerCase();
+    return na.localeCompare(nb) || String(a.p.product_number).localeCompare(String(b.p.product_number));
+  });
+
+  if (onProgress) onProgress("Building Pass 4 queue…", 88);
+
+  const clusters = {};
+  const byProduct = {};
+  const clusterOrder = [];
+  let cid = 0;
+
+  function emit(p, inQueue, scored) {
+    const item = {
+      cluster_id: cid,
+      cluster_size: 1,
+      position_in_cluster: 0,
+      depth: 0,
+      product_number: String(p.product_number),
+      description: p.description || "",
+      linked_to_product: "",
+      score_to_parent: "",
+      n_similar_in_cluster: 0,
+      exact_dup_group: scored?.proposal || "",
+    };
+    clusters[cid] = [item];
+    byProduct[item.product_number] = item;
+    if (inQueue) clusterOrder.push(cid);
+    cid += 1;
+  }
+
+  for (const { p, scored } of review) emit(p, true, scored);
+  for (const p of keepers) {
+    const pn = String(p.product_number);
+    if (byProduct[pn]) continue;
+    emit(p, false, autoDecisions[pn] ? { proposal: autoDecisions[pn].proposal } : null);
+  }
+
+  if (onProgress) onProgress("Pass 4 ready", 100);
+  return {
+    catalog: {
+      cluster_order: clusterOrder,
+      clusters,
+      by_product: byProduct,
+      semantic: {},
+      stats: {
+        n_products: Object.keys(byProduct).length,
+        n_clusters: clusterOrder.length,
+        n_keepers: keepers.length,
+        n_auto_standard: Object.values(autoDecisions).filter((d) => d.status === "standard").length,
+        n_auto_rewritten: Object.values(autoDecisions).filter((d) => d.status === "rewritten").length,
+        n_review: review.length,
       },
     },
     autoDecisions,

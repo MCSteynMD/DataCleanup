@@ -2,3 +2,5 @@
 .dev.vars
 .wrangler/
 node_modules/
+data/*.dump.json
+data/procurement-naming-dump.json

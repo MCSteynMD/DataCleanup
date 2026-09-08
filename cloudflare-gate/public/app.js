@@ -1,4 +1,4 @@
-import { clusterProducts, tokenDiff, buildPass2Catalog } from "./engine.js?v=18";
+import { clusterProducts, tokenDiff, buildPass2Catalog, buildPass3Catalog, buildPass4Catalog, scorePass3Product, scorePass4Product } from "./engine.js?v=21";
 
 /** Parent/reference description for alphabetical cluster ordering. */
 function clusterParentName(clusters, cid) {
@@ -25,6 +25,7 @@ const state = {
   pass: 1,
   jobId: null,
   jobName: "",
+  sourceJobId: "",
   catalog: null,
   decisions: {},
   moves: {},
@@ -102,7 +103,28 @@ function setProgress(on, msg = "", pct = 0) {
 function normalizeStatus(s) {
   if (s === "same") return "duplicate";
   if (s === "different") return "unique";
+  if (s === "complete") return "ok";
+  if (s === "thin") return "insufficient";
+  if (s === "standardised" || s === "standardized") return "rewritten";
+  if (s === "non-standard" || s === "rewrite") return "nonstandard";
   return s || "unreviewed";
+}
+
+function passNum(value = state.pass) {
+  const n = Number(value);
+  return n === 2 || n === 3 || n === 4 ? n : 1;
+}
+
+function isPass3() {
+  return passNum() === 3;
+}
+
+function isPass4() {
+  return passNum() === 4;
+}
+
+function isSingleItemPass() {
+  return isPass3() || isPass4();
 }
 
 function isDarkTheme() {
@@ -140,6 +162,11 @@ const STATUS_LABELS = {
   discard: "Discard",
   skip: "Skip",
   unreviewed: "Unreviewed",
+  ok: "OK",
+  insufficient: "Insufficient",
+  standard: "Standard",
+  rewritten: "Rewritten",
+  nonstandard: "Non-standard",
 };
 
 function statusLabel(s) {
@@ -243,14 +270,17 @@ function computeReviewStats() {
   const reviewCids = new Set(clusterOrder);
   const decisions = state.decisions || {};
   const completed = state.completed || new Set();
-  const counts = { duplicate: 0, unique: 0, discard: 0, skip: 0 };
+  const counts = { duplicate: 0, unique: 0, discard: 0, skip: 0, ok: 0, insufficient: 0, standard: 0, rewritten: 0, nonstandard: 0 };
 
   // Parent/reference products are not in the duel queue — exclude them from
   // reviewable totals so "all children marked" can reach 100%.
+  // Pass 3/4 mark the single product in each cluster (there is no duel parent).
   const parentPns = new Set();
-  for (const cid of clusterOrder) {
-    const root = clusterRoot(clusters[cid] || []);
-    if (root?.product_number) parentPns.add(root.product_number);
+  if (!isSingleItemPass()) {
+    for (const cid of clusterOrder) {
+      const root = clusterRoot(clusters[cid] || []);
+      if (root?.product_number) parentPns.add(root.product_number);
+    }
   }
 
   let reviewedInQueue = 0;
@@ -260,16 +290,17 @@ function computeReviewStats() {
     if (parentPns.has(pn)) continue;
     const st = normalizeStatus(dec.status);
     if (counts[st] != null) counts[st] += 1;
-    if (reviewCids.has(item.cluster_id) && (item.cluster_size || 0) > 1) {
+    if (reviewCids.has(item.cluster_id) && (isSingleItemPass() || (item.cluster_size || 0) > 1)) {
       reviewedInQueue += 1;
     }
   }
-  const reviewed = counts.duplicate + counts.unique + counts.discard + counts.skip;
+  const reviewed = counts.duplicate + counts.unique + counts.discard + counts.skip + counts.ok + counts.insufficient + counts.standard + counts.rewritten + counts.nonstandard;
   const total = Object.keys(byProduct).length;
   let unmatched = 0;
   let reviewable = 0;
   for (const cid of clusterOrder) {
-    reviewable += clusterCandidates(clusters[cid] || []).length;
+    if (isSingleItemPass()) reviewable += (clusters[cid] || []).length ? 1 : 0;
+    else reviewable += clusterCandidates(clusters[cid] || []).length;
   }
   for (const it of Object.values(byProduct)) {
     if ((it.cluster_size || 0) <= 1) unmatched += 1;
@@ -280,9 +311,15 @@ function computeReviewStats() {
   let currentClusterSize = 0;
   let currentClusterReviewed = 0;
   if (currentClusterId != null) {
-    const cands = clusterCandidates(clusters[currentClusterId] || []);
-    currentClusterSize = cands.length;
-    currentClusterReviewed = cands.filter((i) => decisions[i.product_number]).length;
+    if (isSingleItemPass()) {
+      const members = clusters[currentClusterId] || [];
+      currentClusterSize = members.length ? 1 : 0;
+      currentClusterReviewed = members.filter((i) => decisions[i.product_number]).length ? 1 : 0;
+    } else {
+      const cands = clusterCandidates(clusters[currentClusterId] || []);
+      currentClusterSize = cands.length;
+      currentClusterReviewed = cands.filter((i) => decisions[i.product_number]).length;
+    }
   }
   const times = { ...parentTimesNormalized() };
   if (state.timerClusterId != null && state.timerStartedAt != null) {
@@ -308,10 +345,20 @@ function computeReviewStats() {
     unique: counts.unique,
     discard: counts.discard,
     skip: counts.skip,
+    ok: counts.ok,
+    insufficient: counts.insufficient,
+    standard: counts.standard,
+    rewritten: counts.rewritten,
+    nonstandard: counts.nonstandard,
     duplicate_pct_of_reviewed: pct(counts.duplicate, reviewed),
     unique_pct_of_reviewed: pct(counts.unique, reviewed),
     discard_pct_of_reviewed: pct(counts.discard, reviewed),
     skip_pct_of_reviewed: pct(counts.skip, reviewed),
+    ok_pct_of_reviewed: pct(counts.ok, reviewed),
+    insufficient_pct_of_reviewed: pct(counts.insufficient, reviewed),
+    standard_pct_of_reviewed: pct(counts.standard, reviewed),
+    rewritten_pct_of_reviewed: pct(counts.rewritten, reviewed),
+    nonstandard_pct_of_reviewed: pct(counts.nonstandard, reviewed),
     duplicate_pct_of_total: pct(counts.duplicate, total),
     current_cluster_id: currentClusterId,
     current_cluster_index: state.clusterIndex,
@@ -326,8 +373,7 @@ function computeReviewStats() {
 }
 
 function currentJobPassLabel() {
-  const pass = Number(state.pass) === 2 ? 2 : 1;
-  return `Pass ${pass}`;
+  return `Pass ${passNum()}`;
 }
 
 function currentJobReportMeta() {
@@ -335,7 +381,7 @@ function currentJobReportMeta() {
   const name = state.jobName || "Untitled job";
   const id = state.jobId || "";
   return {
-    pass: Number(state.pass) === 2 ? 2 : 1,
+    pass: passNum(),
     passLabel,
     name,
     id,
@@ -358,8 +404,8 @@ function formatReviewStats(stats) {
     "",
     "Catalog",
     `  Products total     ${stats.total.toLocaleString()}`,
-    `  In review queue    ${stats.reviewable.toLocaleString()} (near-duplicate clusters)`,
-    `  Unmatched kept     ${stats.unmatched.toLocaleString()} (no near-dupe — not dropped)`,
+    `  In review queue    ${stats.reviewable.toLocaleString()} (${isPass4() ? "non-standard grey zone" : isPass3() ? "completeness grey zone" : "near-duplicate clusters"})`,
+    `  Unmatched kept     ${stats.unmatched.toLocaleString()} ${isPass4() ? "(auto standard / rewrite, not in queue)" : isPass3() ? "(auto OK / discard, not in queue)" : "(no near-dupe — not dropped)"}`,
     "",
     "Review progress (queue only)",
     `  Reviewed     ${stats.reviewed_in_queue.toLocaleString()} / ${stats.reviewable.toLocaleString()}  (${stats.reviewed_pct.toFixed(1)}%)`,
@@ -381,9 +427,24 @@ function formatReviewStats(stats) {
     `  Average       ${formatDuration(stats.avg_seconds_per_parent)} per parent`,
     "",
     "Decisions (marked items)",
-    `  Duplicate    ${stats.duplicate.toLocaleString()}  (${stats.duplicate_pct_of_reviewed.toFixed(1)}%)`,
-    `  Unique       ${stats.unique.toLocaleString()}  (${stats.unique_pct_of_reviewed.toFixed(1)}%)`,
-    `  Discard      ${stats.discard.toLocaleString()}  (${stats.discard_pct_of_reviewed.toFixed(1)}%)`,
+    ...(isPass4()
+      ? [
+          `  Standard      ${(stats.standard || 0).toLocaleString()}  (${(stats.standard_pct_of_reviewed || 0).toFixed(1)}%)`,
+          `  Rewritten     ${(stats.rewritten || 0).toLocaleString()}  (${(stats.rewritten_pct_of_reviewed || 0).toFixed(1)}%)`,
+          `  Non-standard  ${(stats.nonstandard || 0).toLocaleString()}  (${(stats.nonstandard_pct_of_reviewed || 0).toFixed(1)}%)`,
+          `  Discard       ${stats.discard.toLocaleString()}  (${stats.discard_pct_of_reviewed.toFixed(1)}%)`,
+        ]
+      : isPass3()
+      ? [
+          `  OK            ${(stats.ok || 0).toLocaleString()}  (${(stats.ok_pct_of_reviewed || 0).toFixed(1)}%)`,
+          `  Insufficient  ${(stats.insufficient || 0).toLocaleString()}  (${(stats.insufficient_pct_of_reviewed || 0).toFixed(1)}%)`,
+          `  Discard       ${stats.discard.toLocaleString()}  (${stats.discard_pct_of_reviewed.toFixed(1)}%)`,
+        ]
+      : [
+          `  Duplicate    ${stats.duplicate.toLocaleString()}  (${stats.duplicate_pct_of_reviewed.toFixed(1)}%)`,
+          `  Unique       ${stats.unique.toLocaleString()}  (${stats.unique_pct_of_reviewed.toFixed(1)}%)`,
+          `  Discard      ${stats.discard.toLocaleString()}  (${stats.discard_pct_of_reviewed.toFixed(1)}%)`,
+        ]),
   );
   if (stats.skip) {
     lines.push(
@@ -393,9 +454,21 @@ function formatReviewStats(stats) {
   lines.push(
     "",
     "Key rates",
-    `  Duplicate rate   ${stats.duplicate_pct_of_reviewed.toFixed(1)}% of marked`,
-    `  Unique rate      ${stats.unique_pct_of_reviewed.toFixed(1)}% of marked`,
-    `  Duplicates found ${stats.duplicate.toLocaleString()} (${stats.duplicate_pct_of_total.toFixed(1)}% of all products)`,
+    ...(isPass4()
+      ? [
+          `  Standard rate     ${(stats.standard_pct_of_reviewed || 0).toFixed(1)}% of marked`,
+          `  Non-standard rate ${(stats.nonstandard_pct_of_reviewed || 0).toFixed(1)}% of marked`,
+        ]
+      : isPass3()
+      ? [
+          `  OK rate           ${(stats.ok_pct_of_reviewed || 0).toFixed(1)}% of marked`,
+          `  Insufficient rate ${(stats.insufficient_pct_of_reviewed || 0).toFixed(1)}% of marked`,
+        ]
+      : [
+          `  Duplicate rate   ${stats.duplicate_pct_of_reviewed.toFixed(1)}% of marked`,
+          `  Unique rate      ${stats.unique_pct_of_reviewed.toFixed(1)}% of marked`,
+          `  Duplicates found ${stats.duplicate.toLocaleString()} (${stats.duplicate_pct_of_total.toFixed(1)}% of all products)`,
+        ]),
     "",
     "Session",
     `  Source file  ${stats.source_file || "(none)"}`,
@@ -591,8 +664,19 @@ function renderReports() {
       job.shortId ? ` <span class="hint">(${escapeHtml(job.shortId)})</span>` : ""
     }. Figures and Excel export include this open job’s review queue and decisions — not other passes or jobs.`;
   }
+  const p12Btn = $("#btnReportsPass12");
+  if (p12Btn) {
+    const canP12 = Boolean(pass2JobIdForConsolidate());
+    p12Btn.hidden = !canP12;
+  }
   const dupHeading = $("#reportsDupHeading");
-  if (dupHeading) dupHeading.textContent = `Duplicates marked · ${job.passLabel}`;
+  if (dupHeading) {
+    dupHeading.textContent = isPass4()
+      ? `Non-standard · ${job.passLabel}`
+      : isPass3()
+        ? `Insufficient · ${job.passLabel}`
+        : `Duplicates marked · ${job.passLabel}`;
+  }
   const clusterHeading = $("#reportsClusterHeading");
   if (clusterHeading) clusterHeading.textContent = `Cluster progress · ${job.passLabel}`;
 
@@ -602,7 +686,7 @@ function renderReports() {
       `<div class="kpi"><strong>${escapeHtml(job.passLabel)}</strong><div>${escapeHtml(job.name)}</div><span>this job only · id ${escapeHtml(job.shortId || "—")}</span></div>`,
       `<div class="kpi"><strong>Catalog</strong><div>${stats.total.toLocaleString()}</div><span>${stats.reviewable.toLocaleString()} in queue · ${stats.unmatched.toLocaleString()} unmatched kept</span></div>`,
       `<div class="kpi"><strong>Queue reviewed</strong><div>${stats.reviewed_in_queue.toLocaleString()} / ${stats.reviewable.toLocaleString()}</div><span>${stats.reviewed_pct.toFixed(1)}% · ${stats.remaining.toLocaleString()} left</span></div>`,
-      `<div class="kpi"><strong>Duplicates</strong><div>${stats.duplicate.toLocaleString()}</div><span>${stats.duplicate_pct_of_total.toFixed(1)}% of all</span></div>`,
+      `<div class="kpi"><strong>${isPass4() ? "Non-standard" : isPass3() ? "Insufficient" : "Duplicates"}</strong><div>${(isPass4() ? stats.nonstandard : isPass3() ? stats.insufficient : stats.duplicate).toLocaleString()}</div><span>${isPass4() ? `${(stats.nonstandard_pct_of_reviewed || 0).toFixed(1)}% of marked` : isPass3() ? `${(stats.insufficient_pct_of_reviewed || 0).toFixed(1)}% of marked` : `${stats.duplicate_pct_of_total.toFixed(1)}% of all`}</span></div>`,
       `<div class="kpi"><strong>Avg / parent</strong><div>${formatDuration(stats.avg_seconds_per_parent)}</div><span>${stats.timed_parents.toLocaleString()} timed · ${formatDuration(stats.total_parent_seconds)} total</span></div>`,
     ].join("");
   }
@@ -611,7 +695,7 @@ function renderReports() {
 
   const dupBody = $("#reportsDupTable tbody");
   if (dupBody) {
-    const dups = decisionRows.filter((r) => r.status === "duplicate");
+    const dups = decisionRows.filter((r) => r.status === (isPass4() ? "nonstandard" : isPass3() ? "insufficient" : "duplicate"));
     dupBody.innerHTML = dups
       .map(
         (r) => `<tr>
@@ -622,7 +706,7 @@ function renderReports() {
         <td>${escapeHtml(r.updated_at)}</td>
       </tr>`,
       )
-      .join("") || `<tr><td colspan="5" class="empty">No duplicates marked yet for this job.</td></tr>`;
+      .join("") || `<tr><td colspan="5" class="empty">${isPass4() ? "No non-standard names marked yet for this job." : isPass3() ? "No insufficient names marked yet for this job." : "No duplicates marked yet for this job."}</td></tr>`;
   }
 
   const clusterBody = $("#reportsClusterTable tbody");
@@ -771,6 +855,207 @@ function exportManagementExcel() {
     .slice(0, 60);
   const passSlug = `pass${job.pass}`;
   XLSX.writeFile(wb, `similarity_report_${passSlug}_${jobSlug}_${stamp}.xlsx`);
+}
+
+function isDropStatus(st) {
+  return st === "duplicate" || st === "discard";
+}
+
+function fileSlug(name) {
+  return String(name || "job")
+    .replace(/[^\w.\-]+/g, "_")
+    .slice(0, 60);
+}
+
+function statusOf(decisions, pn) {
+  return normalizeStatus(decisions?.[String(pn)]?.status);
+}
+
+/**
+ * One row per product after Pass 1 + Pass 2.
+ * Later drop wins (Pass 2 Duplicate/Discard over Pass 1). Unmarked = Unique (kept).
+ */
+function consolidatePass12Rows(pass1Catalog, pass1Decisions, pass2Catalog, pass2Decisions) {
+  const by2 = pass2Catalog?.by_product || {};
+  const by1 = pass1Catalog?.by_product || {};
+  const pns = new Set([...Object.keys(by2), ...Object.keys(by1)]);
+  const rows = [];
+  for (const pn of pns) {
+    const p2 = by2[pn];
+    const p1 = by1[pn];
+    const item = p2 || p1 || {};
+    const s1 = statusOf(pass1Decisions, pn);
+    const s2 = statusOf(pass2Decisions, pn);
+    let final;
+    let decidedIn;
+    if (isDropStatus(s2)) {
+      final = s2;
+      decidedIn = "Pass 2";
+    } else if (isDropStatus(s1)) {
+      final = s1;
+      decidedIn = "Pass 1";
+    } else if (s2 === "unique") {
+      final = "unique";
+      decidedIn = "Pass 2";
+    } else if (s1 === "unique") {
+      final = "unique";
+      decidedIn = "Pass 1";
+    } else {
+      final = "unique";
+      decidedIn = "Unreviewed — kept";
+    }
+    const linked =
+      final === "duplicate"
+        ? decidedIn === "Pass 1"
+          ? p1?.linked_to_product || p2?.linked_to_product || ""
+          : p2?.linked_to_product || p1?.linked_to_product || ""
+        : "";
+    const score =
+      final === "duplicate"
+        ? decidedIn === "Pass 1"
+          ? p1?.score_to_parent ?? p2?.score_to_parent ?? ""
+          : p2?.score_to_parent ?? p1?.score_to_parent ?? ""
+        : "";
+    rows.push({
+      product_number: pn,
+      description: item.description || p1?.description || p2?.description || "",
+      final,
+      final_label: statusLabel(final),
+      decided_in: decidedIn,
+      pass1_status: s1 === "unreviewed" ? "" : statusLabel(s1),
+      pass1_note: pass1Decisions?.[pn]?.note || "",
+      pass2_status: s2 === "unreviewed" ? "" : statusLabel(s2),
+      pass2_note: pass2Decisions?.[pn]?.note || "",
+      linked_to: linked,
+      score_to_parent: score,
+      cluster_id: p2?.cluster_id ?? p1?.cluster_id ?? "",
+    });
+  }
+  rows.sort(
+    (a, b) =>
+      a.final.localeCompare(b.final) ||
+      String(a.product_number).localeCompare(String(b.product_number)),
+  );
+  return rows;
+}
+
+function writePass12Excel({ pass1Job, pass2Job, rows }) {
+  if (typeof XLSX === "undefined") {
+    throw new Error("SheetJS is required for Excel export.");
+  }
+  const n = rows.length;
+  const nUnique = rows.filter((r) => r.final === "unique").length;
+  const nDup = rows.filter((r) => r.final === "duplicate").length;
+  const nDisc = rows.filter((r) => r.final === "discard").length;
+  const byDecided = {};
+  for (const r of rows) {
+    byDecided[r.decided_in] = (byDecided[r.decided_in] || 0) + 1;
+  }
+  const wb = XLSX.utils.book_new();
+  const header = [
+    "Product",
+    "Description",
+    "Final status",
+    "Decided in",
+    "Pass 1 status",
+    "Pass 1 note",
+    "Pass 2 status",
+    "Pass 2 note",
+    "Linked to (duplicate of)",
+    "Score to parent",
+    "Cluster",
+  ];
+  const toAoa = (list) => [
+    header,
+    ...list.map((r) => [
+      r.product_number,
+      r.description,
+      r.final_label,
+      r.decided_in,
+      r.pass1_status,
+      r.pass1_note,
+      r.pass2_status,
+      r.pass2_note,
+      r.linked_to,
+      r.score_to_parent,
+      r.cluster_id,
+    ]),
+  ];
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.aoa_to_sheet([
+      ["Metric", "Value"],
+      ["Report", "Consolidated Pass 1 + Pass 2 (before completeness)"],
+      ["Generated (UTC)", new Date().toISOString()],
+      ["Pass 1 job", pass1Job?.name || ""],
+      ["Pass 1 id", pass1Job?.id || ""],
+      ["Pass 2 job", pass2Job?.name || ""],
+      ["Pass 2 id", pass2Job?.id || ""],
+      ["Products", n],
+      ["Unique (keepers)", nUnique],
+      ["Duplicate", nDup],
+      ["Discard", nDisc],
+      ["Decided in Pass 1 (drop or unique mark)", byDecided["Pass 1"] || 0],
+      ["Decided in Pass 2", byDecided["Pass 2"] || 0],
+      ["Unreviewed — kept", byDecided["Unreviewed — kept"] || 0],
+    ]),
+    "Summary",
+  );
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(toAoa(rows)), "All Products");
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.aoa_to_sheet(toAoa(rows.filter((r) => r.final === "unique"))),
+    "Keepers",
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.aoa_to_sheet(toAoa(rows.filter((r) => r.final === "duplicate"))),
+    "Duplicates",
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.aoa_to_sheet(toAoa(rows.filter((r) => r.final === "discard"))),
+    "Discards",
+  );
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "").slice(0, 12);
+  const slug = fileSlug(pass2Job?.name || pass2Job?.id || "pass2");
+  XLSX.writeFile(wb, `pass12_consolidated_${slug}_${stamp}.xlsx`);
+}
+
+async function exportPass12FromJob(pass2JobId, pass2Name = "") {
+  if (!pass2JobId) {
+    throw new Error("Pick a Pass 2 job first.");
+  }
+  setProgress(true, "Loading Pass 2 job…", 8);
+  try {
+    const p2 = await loadJobCatalog(pass2JobId, "Pass 2");
+    const pass1Id = p2.data.job?.source_job_id;
+    let p1 = { catalog: { by_product: {} }, decisions: {}, data: { job: {} } };
+    if (pass1Id) {
+      setProgress(true, "Loading Pass 1 job…", 40);
+      try {
+        p1 = await loadJobCatalog(pass1Id, "Pass 1");
+      } catch (err) {
+        console.warn("Pass 1 catalog missing; consolidating from Pass 2 only", err);
+      }
+    }
+    setProgress(true, "Building Pass 1+2 workbook…", 78);
+    const rows = consolidatePass12Rows(p1.catalog, p1.decisions, p2.catalog, p2.decisions);
+    writePass12Excel({
+      pass1Job: { id: pass1Id || "", name: p1.data.job?.name || "" },
+      pass2Job: { id: pass2JobId, name: p2.data.job?.name || pass2Name },
+      rows,
+    });
+  } finally {
+    setProgress(false);
+  }
+}
+
+function pass2JobIdForConsolidate() {
+  const pass = passNum();
+  if (pass === 2) return state.jobId;
+  if (pass === 3) return state.sourceJobId || "";
+  return "";
 }
 
 function clusterRoot(items) {
@@ -1277,6 +1562,8 @@ async function deleteJob(id, name = "") {
     }
     await refreshJobs();
     if (state.pass === 2) await refreshPass1Sources().catch(() => {});
+    if (state.pass === 3) await refreshPass2Sources().catch(() => {});
+    if (state.pass === 4) await refreshPass3Sources().catch(() => {});
   } catch (err) {
     console.error(err);
     alert(err.message || String(err));
@@ -1435,23 +1722,33 @@ async function handleFile(file) {
 }
 
 async function refreshJobs() {
-  const pass = state.pass === 2 ? 2 : 1;
+  const pass = passNum();
   const { jobs } = await api(`/api/jobs?pass=${pass}`);
-  const host = pass === 2 ? $("#pass2JobList") : $("#jobList");
+  const host =
+    pass === 4 ? $("#pass4JobList") : pass === 3 ? $("#pass3JobList") : pass === 2 ? $("#pass2JobList") : $("#jobList");
   if (!host) return;
   if (!jobs.length) {
     host.innerHTML =
-      pass === 2
-        ? `<h2>Pass 2 jobs</h2><p class="hint">None yet — build one from a Pass 1 job above.</p>`
-        : "";
+      pass === 4
+        ? `<h2>Pass 4 jobs</h2><p class="hint">None yet — build one from a Pass 3 job above.</p>`
+        : pass === 3
+        ? `<h2>Pass 3 jobs</h2><p class="hint">None yet — build one from a Pass 2 job above.</p>`
+        : pass === 2
+          ? `<h2>Pass 2 jobs</h2><p class="hint">None yet — build one from a Pass 1 job above.</p>`
+          : "";
     return;
   }
-  host.innerHTML = `<h2>${pass === 2 ? "Pass 2 jobs" : "Saved jobs"}</h2>${jobs
+  host.innerHTML = `<h2>${pass === 4 ? "Pass 4 jobs" : pass === 3 ? "Pass 3 jobs" : pass === 2 ? "Pass 2 jobs" : "Saved jobs"}</h2>${jobs
     .map(
       (j) => `<div class="job-row">
       <div><strong>${escapeHtml(j.name)}</strong><br/><span class="job-meta">${j.n_clusters} review clusters · ${Number(j.n_products).toLocaleString()} products${j.source_job_id ? ` · from ${escapeHtml(String(j.source_job_id).slice(0, 8))}…` : ""}</span></div>
       <div class="job-actions">
         <button type="button" class="btn primary" data-open-job="${j.id}">Open</button>
+        ${
+          pass === 2
+            ? `<button type="button" class="btn" data-export-pass12="${j.id}" data-export-name="${escapeHtml(j.name)}" title="Excel: Unique / Duplicate / Discard after Pass 1 and 2">Export 1+2</button>`
+            : ""
+        }
         <button type="button" class="btn danger" data-delete-job="${j.id}" data-delete-name="${escapeHtml(j.name)}">Delete</button>
       </div>
     </div>`,
@@ -1463,6 +1760,17 @@ async function refreshJobs() {
   host.querySelectorAll("[data-delete-job]").forEach((btn) => {
     btn.addEventListener("click", () => {
       deleteJob(btn.getAttribute("data-delete-job"), btn.getAttribute("data-delete-name") || "");
+    });
+  });
+  host.querySelectorAll("[data-export-pass12]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      exportPass12FromJob(
+        btn.getAttribute("data-export-pass12"),
+        btn.getAttribute("data-export-name") || "",
+      ).catch((e) => {
+        setProgress(false);
+        alert(e.message || String(e));
+      });
     });
   });
 }
@@ -1601,26 +1909,285 @@ async function startPass2FromJob(sourceJobId, sourceName = "") {
   );
 }
 
+async function refreshPass2Sources() {
+  const host = $("#pass2SourceList");
+  if (!host) return;
+  const { jobs } = await api("/api/jobs?pass=2");
+  if (!jobs.length) {
+    host.innerHTML = `<h2>Pass 2 sources</h2><p class="hint">No Pass 2 jobs yet — finish Pass 2 first.</p>`;
+    return;
+  }
+  host.innerHTML = `<h2>Build from Pass 2</h2>${jobs
+    .map(
+      (j) => `<div class="job-row">
+      <div><strong>${escapeHtml(j.name)}</strong><br/><span class="job-meta">${j.n_clusters} clusters · ${Number(j.n_products).toLocaleString()} products</span></div>
+      <div class="job-actions">
+        <button type="button" class="btn" data-export-pass12="${j.id}" data-export-name="${escapeHtml(j.name)}" title="Excel: Unique / Duplicate / Discard after Pass 1 and 2">Export 1+2</button>
+        <button type="button" class="btn primary" data-build-pass3="${j.id}" data-build-name="${escapeHtml(j.name)}">Start Pass 3</button>
+      </div>
+    </div>`,
+    )
+    .join("")}`;
+  host.querySelectorAll("[data-build-pass3]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      startPass3FromJob(
+        btn.getAttribute("data-build-pass3"),
+        btn.getAttribute("data-build-name") || "",
+      ).catch((e) => {
+        setProgress(false);
+        alert(e.message || String(e));
+      });
+    });
+  });
+  host.querySelectorAll("[data-export-pass12]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      exportPass12FromJob(
+        btn.getAttribute("data-export-pass12"),
+        btn.getAttribute("data-export-name") || "",
+      ).catch((e) => {
+        setProgress(false);
+        alert(e.message || String(e));
+      });
+    });
+  });
+}
+
+async function loadJobCatalog(sourceJobId, label = "job") {
+  const data = await api(`/api/jobs/${sourceJobId}`);
+  let catalog = data.catalog;
+  if (!catalog?.by_product || !Object.keys(catalog.by_product).length) {
+    const cached = await idbGet(sourceJobId);
+    if (cached) catalog = applyMoves(cached, data.moves || {});
+  } else {
+    catalog = applyMoves(catalog, data.moves || {});
+  }
+  if (!catalog?.by_product || !Object.keys(catalog.by_product).length) {
+    throw new Error(`${label} catalog missing — reopen that job once, then try again.`);
+  }
+  return { data, catalog, decisions: data.decisions || {} };
+}
+
+async function startPass3FromJob(sourceJobId, sourceName = "") {
+  setProgress(true, "Loading Pass 2 job…", 8);
+  const { catalog, decisions } = await loadJobCatalog(sourceJobId, "Pass 2");
+
+  setProgress(true, "Scoring descriptions…", 20);
+  const { catalog: pass3Catalog, autoDecisions } = await buildPass3Catalog(
+    catalog,
+    decisions,
+    (msg, pct) => setProgress(true, msg, 20 + pct * 0.55),
+  );
+
+  const nQueue = pass3Catalog.cluster_order.length;
+  const stats = pass3Catalog.stats || {};
+
+  setProgress(true, "Creating Pass 3 job…", 80);
+  const created = await api("/api/jobs", {
+    method: "POST",
+    body: JSON.stringify({
+      name: `Pass3 ← ${sourceName || sourceJobId}`,
+      source_kind: "pass3",
+      pass_number: 3,
+      source_job_id: sourceJobId,
+      n_products: Object.keys(pass3Catalog.by_product).length,
+      n_clusters: nQueue,
+    }),
+  });
+
+  try {
+    await idbSet(created.id, pass3Catalog);
+  } catch (e) {
+    console.warn("IndexedDB cache skipped", e);
+  }
+
+  setProgress(true, "Saving Pass 3 catalog…", 86);
+  try {
+    await uploadCatalogToD1(created.id, pass3Catalog);
+  } catch (err) {
+    console.warn("Cloud product sync failed; using local cache", err);
+    alert(
+      `Cloud sync had a problem (${err.message}).\n\nReview will continue on this browser; decisions still save.`,
+    );
+  }
+
+  const autoItems = Object.entries(autoDecisions).map(([pn, d]) => ({
+    product_number: pn,
+    status: d.status,
+    cluster_id: pass3Catalog.by_product[pn]?.cluster_id ?? null,
+    note: d.note || "",
+  }));
+  if (autoItems.length) {
+    setProgress(true, `Pre-marking ${autoItems.length.toLocaleString()} auto decisions…`, 92);
+    for (let i = 0; i < autoItems.length; i += 400) {
+      await api(`/api/jobs/${created.id}/decisions/batch`, {
+        method: "POST",
+        body: JSON.stringify({ items: autoItems.slice(i, i + 400) }),
+      });
+    }
+  }
+
+  state.pass = 3;
+  syncPassTabUi();
+  setProgress(true, "Opening Pass 3…", 98);
+  await openJob(created.id, pass3Catalog);
+  await refreshJobs();
+  setRelatedBanner(
+    `Pass 3 ready · ${nQueue.toLocaleString()} to review · ${Number(stats.n_auto_ok || 0).toLocaleString()} auto OK · ${Number(stats.n_auto_discard || 0).toLocaleString()} discarded · ${Number(stats.n_auto_insufficient || 0).toLocaleString()} auto insufficient`,
+  );
+}
+
+async function refreshPass3Sources() {
+  const host = $("#pass3SourceList");
+  if (!host) return;
+  const { jobs } = await api("/api/jobs?pass=3");
+  if (!jobs.length) {
+    host.innerHTML = `<h2>Pass 3 sources</h2><p class="hint">No Pass 3 jobs yet — finish Pass 3 first.</p>`;
+    return;
+  }
+  host.innerHTML = `<h2>Build from Pass 3</h2>${jobs
+    .map(
+      (j) => `<div class="job-row">
+      <div><strong>${escapeHtml(j.name)}</strong><br/><span class="job-meta">${j.n_clusters} clusters · ${Number(j.n_products).toLocaleString()} products</span></div>
+      <div class="job-actions">
+        <button type="button" class="btn primary" data-build-pass4="${j.id}" data-build-name="${escapeHtml(j.name)}">Start Pass 4</button>
+      </div>
+    </div>`,
+    )
+    .join("")}`;
+  host.querySelectorAll("[data-build-pass4]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      startPass4FromJob(
+        btn.getAttribute("data-build-pass4"),
+        btn.getAttribute("data-build-name") || "",
+      ).catch((e) => {
+        setProgress(false);
+        alert(e.message || String(e));
+      });
+    });
+  });
+}
+
+async function startPass4FromJob(sourceJobId, sourceName = "") {
+  setProgress(true, "Loading Pass 3 job…", 8);
+  const { catalog, decisions } = await loadJobCatalog(sourceJobId, "Pass 3");
+
+  setProgress(true, "Checking naming convention…", 20);
+  const { catalog: pass4Catalog, autoDecisions } = await buildPass4Catalog(
+    catalog,
+    decisions,
+    (msg, pct) => setProgress(true, msg, 20 + pct * 0.55),
+  );
+
+  const nQueue = pass4Catalog.cluster_order.length;
+  const stats = pass4Catalog.stats || {};
+
+  setProgress(true, "Creating Pass 4 job…", 80);
+  const created = await api("/api/jobs", {
+    method: "POST",
+    body: JSON.stringify({
+      name: `Pass4 ← ${sourceName || sourceJobId}`,
+      source_kind: "pass4",
+      pass_number: 4,
+      source_job_id: sourceJobId,
+      n_products: Object.keys(pass4Catalog.by_product).length,
+      n_clusters: nQueue,
+    }),
+  });
+
+  try {
+    await idbSet(created.id, pass4Catalog);
+  } catch (e) {
+    console.warn("IndexedDB cache skipped", e);
+  }
+
+  setProgress(true, "Saving Pass 4 catalog…", 86);
+  try {
+    await uploadCatalogToD1(created.id, pass4Catalog);
+  } catch (err) {
+    console.warn("Cloud product sync failed; using local cache", err);
+    alert(
+      `Cloud sync had a problem (${err.message}).\n\nReview will continue on this browser; decisions still save.`,
+    );
+  }
+
+  const autoItems = Object.entries(autoDecisions).map(([pn, d]) => ({
+    product_number: pn,
+    status: d.status,
+    cluster_id: pass4Catalog.by_product[pn]?.cluster_id ?? null,
+    note: d.note || "",
+  }));
+  if (autoItems.length) {
+    setProgress(true, `Pre-marking ${autoItems.length.toLocaleString()} auto decisions…`, 92);
+    for (let i = 0; i < autoItems.length; i += 400) {
+      await api(`/api/jobs/${created.id}/decisions/batch`, {
+        method: "POST",
+        body: JSON.stringify({ items: autoItems.slice(i, i + 400) }),
+      });
+    }
+  }
+
+  state.pass = 4;
+  syncPassTabUi();
+  setProgress(true, "Opening Pass 4…", 98);
+  await openJob(created.id, pass4Catalog);
+  await refreshJobs();
+  setRelatedBanner(
+    `Pass 4 ready · ${nQueue.toLocaleString()} to review · ${Number(stats.n_auto_standard || 0).toLocaleString()} already standard · ${Number(stats.n_auto_rewritten || 0).toLocaleString()} auto-rewritten`,
+  );
+}
+
 function syncPassTabUi() {
+  const pass = passNum();
   document.querySelectorAll("[data-pass-tab]").forEach((btn) => {
-    btn.classList.toggle("active", Number(btn.getAttribute("data-pass-tab")) === state.pass);
+    btn.classList.toggle("active", Number(btn.getAttribute("data-pass-tab")) === pass);
   });
   const p1 = $("#pass1Upload");
   const p2 = $("#pass2Upload");
-  if (p1) p1.classList.toggle("hidden", state.pass !== 1);
-  if (p2) p2.classList.toggle("hidden", state.pass !== 2);
+  const p3 = $("#pass3Upload");
+  const p4 = $("#pass4Upload");
+  if (p1) p1.classList.toggle("hidden", pass !== 1);
+  if (p2) p2.classList.toggle("hidden", pass !== 2);
+  if (p3) p3.classList.toggle("hidden", pass !== 3);
+  if (p4) p4.classList.toggle("hidden", pass !== 4);
+  syncPass3Chrome();
+}
+
+function syncPass3Chrome() {
+  const p3 = isPass3();
+  const p4 = isPass4();
+  const single = isSingleItemPass();
+  const dup = $("#btnDup");
+  const uniq = $("#btnUnique");
+  const help = document.querySelector(".decision-bar .help");
+  if (dup) dup.textContent = p4 ? "Non-standard ←" : p3 ? "Insufficient ←" : "Duplicate ←";
+  if (uniq) uniq.textContent = p4 ? "Standard →" : p3 ? "OK →" : "Unique →";
+  if (help) {
+    help.textContent = p4
+      ? "← non-standard · → Standard (accepts proposal) · ↑ discard · ↓ unreview · Space = next · L = last review · R = Reports · T = dark"
+      : p3
+      ? "← insufficient · → OK · ↑ discard · ↓ unreview · Space = next · L = last review · R = Reports · T = dark"
+      : "Alt+↓ = next child · Ctrl+Alt+↓ = prev child · Space = next parent · L = last review · ← dup · → unique · G = Related · R = Reports · T = dark · Focus mode locks keys";
+  }
+  const rel = $("#relatedPanel");
+  const relBtn = $("#btnRelatedRun");
+  if (rel) rel.classList.toggle("hidden", single);
+  if (relBtn) relBtn.classList.toggle("hidden", single);
 }
 
 function setPass(pass) {
-  state.pass = pass === 2 ? 2 : 1;
+  state.pass = passNum(pass);
   syncPassTabUi();
   pauseParentTimer({ persist: true });
   showScreen("upload");
   updateTop();
   if (state.pass === 1) {
     refreshJobs().catch((e) => console.warn(e));
-  } else {
+  } else if (state.pass === 2) {
     Promise.all([refreshPass1Sources(), refreshJobs()]).catch((e) => console.warn(e));
+  } else if (state.pass === 3) {
+    Promise.all([refreshPass2Sources(), refreshJobs()]).catch((e) => console.warn(e));
+  } else {
+    Promise.all([refreshPass3Sources(), refreshJobs()]).catch((e) => console.warn(e));
   }
 }
 
@@ -1665,7 +2232,8 @@ async function openJob(id, localCatalog = null) {
     setProgress(true, "Preparing review…", 70);
     state.jobId = id;
     state.jobName = data.job.name;
-    const jobPass = Number(data.job.pass_number) === 2 ? 2 : 1;
+    state.sourceJobId = data.job.source_job_id || "";
+    const jobPass = passNum(data.job.pass_number);
     state.pass = jobPass;
     syncPassTabUi();
     state.catalog = applyMoves(data.catalog, data.moves || {});
@@ -1691,9 +2259,9 @@ async function openJob(id, localCatalog = null) {
         if (!clusters[it.cluster_id]) clusters[it.cluster_id] = [];
         clusters[it.cluster_id].push(it);
       }
-      // Review queue = near-duplicate clusters only (size ≥ 2)
+      // Review queue = near-duplicate clusters only (size ≥ 2), except Pass 3/4 (size 1)
       for (const [cid, members] of Object.entries(clusters)) {
-        if (members.length > 1) seen.push(Number(cid));
+        if (jobPass === 3 || jobPass === 4 ? members.length >= 1 : members.length > 1) seen.push(Number(cid));
       }
       state.catalog.cluster_order = sortClusterOrderByName(seen, clusters);
       state.catalog.clusters = clusters;
@@ -1727,7 +2295,7 @@ async function openJob(id, localCatalog = null) {
     if (state.catalog.clusters) {
       state.catalog.cluster_order = sortClusterOrderByName(
         state.catalog.cluster_order.filter(
-          (cid) => (state.catalog.clusters[cid]?.length || 0) > 1,
+          (cid) => (state.catalog.clusters[cid]?.length || 0) >= (jobPass === 3 || jobPass === 4 ? 1 : 2),
         ),
         state.catalog.clusters,
       );
@@ -1813,6 +2381,42 @@ function renderCluster() {
   const cid = state.catalog.cluster_order[state.clusterIndex];
   if (state.timerClusterId !== cid) resumeParentTimer(cid);
   const items = state.catalog.clusters[cid] || [];
+
+  if (isSingleItemPass()) {
+    const item = items[0];
+    state.reference = item?.product_number || "";
+    state.candidates = item?.product_number ? [item.product_number] : [];
+    state.selected = item?.product_number || "";
+    const order = state.catalog.cluster_order || [];
+    const start = Math.max(0, state.clusterIndex - 12);
+    const slice = order.slice(start, start + 40);
+    const rail = $("#queueRail");
+    rail.innerHTML = `<h3>Queue</h3>${slice
+      .map((id) => {
+        const it = (state.catalog.clusters[id] || [])[0];
+        if (!it) return "";
+        const pn = it.product_number;
+        const st = normalizeStatus(state.decisions[pn]?.status);
+        const sel = id === cid ? "sel" : "";
+        return `<button type="button" class="q-item ${sel} ${st}" data-cid="${escapeHtml(String(id))}"><span class="q-dot" aria-hidden="true"></span><span>${escapeHtml(pn)}</span></button>`;
+      })
+      .join("")}`;
+    rail.querySelectorAll("[data-cid]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const idx = order.findIndex((id) => String(id) === String(btn.getAttribute("data-cid")));
+        if (idx >= 0) {
+          state.clusterIndex = idx;
+          renderCluster();
+        }
+      });
+    });
+    if (isPass4()) renderPass4Hero(item);
+    else renderPass3Hero(item);
+    updateTop();
+    persistProgress().catch(() => {});
+    return;
+  }
+
   const root = clusterRoot(items);
   state.reference = root?.product_number || "";
   const cands = items
@@ -1843,6 +2447,109 @@ function renderCluster() {
   renderRelated();
   updateTop();
   persistProgress().catch(() => {});
+}
+
+function pass3FamilyPeers(family) {
+  if (!family) return [];
+  const out = [];
+  for (const it of Object.values(state.catalog?.by_product || {})) {
+    const toks = String(it.description || "")
+      .toUpperCase()
+      .split(/[\s,;:/_\-]+/)
+      .filter(Boolean);
+    if (toks[0] === family) out.push(it);
+    if (out.length > 80) break;
+  }
+  return out;
+}
+
+function renderPass3Hero(item) {
+  const host = $("#hero");
+  if (!item) {
+    host.innerHTML = `<div class="hero-diff"><div class="hero-caption">Product</div><div class="hero-pn">—</div><div class="hero-desc">No item in queue.</div></div>`;
+    return;
+  }
+  const peers = pass3FamilyPeers(
+    String(item.description || "")
+      .toUpperCase()
+      .split(/[\s,;:/_\-]+/)
+      .filter(Boolean)[0],
+  );
+  const scored = scorePass3Product(item.product_number, item.description || "", peers);
+  const st = normalizeStatus(state.decisions[item.product_number]?.status);
+  const good = (scored.goodPeers || []).slice(0, 3);
+  const bad = (scored.badPeers || []).slice(0, 3);
+  const feat = scored.feat || {};
+  const chips = [];
+  if (feat.hasNum) chips.push(["has number", "shared"]);
+  if (feat.hasUnit) chips.push(["has unit", "shared"]);
+  if (feat.hasDraw) chips.push(["has code", "drawing"]);
+  if (feat.hasSizeWord) chips.push(["has size word", "shared"]);
+  if ((scored.missing || []).length) {
+    for (const m of scored.missing) chips.push([`missing ${m}`, "miss"]);
+  }
+  host.innerHTML = `<div class="hero-diff p3-hero">
+    <div class="hero-caption">Pass 3 · enough information?</div>
+    <div class="hero-cand-head">
+      <div class="hero-pn">${escapeHtml(item.product_number)}</div>
+      <div class="status-chip ${st}">${escapeHtml(statusLabel(st))}</div>
+    </div>
+    <div class="hero-desc">${escapeHtml(item.description || "(empty)")}</div>
+    <div class="p3-meta">Family <strong>${escapeHtml(scored.family || "—")}</strong>
+      · ${feat.nTok || 0} tokens
+      ${scored.margin ? ` · vs examples ${scored.margin >= 0 ? "+" : ""}${scored.margin.toFixed(2)}` : ""}</div>
+    <div class="chips">${chips.map(([t, cls]) => `<span class="chip ${cls}">${escapeHtml(t)}</span>`).join("")}</div>
+    <div class="p3-reason">${escapeHtml(scored.reason || "Review this name.")}</div>
+    ${good.length ? `<div class="hero-stream-label">Richer in this family</div><div class="p3-peers">${good.map((d) => `<div>${escapeHtml(d)}</div>`).join("")}</div>` : ""}
+    ${bad.length ? `<div class="hero-stream-label miss">Thin examples</div><div class="p3-peers thin">${bad.map((d) => `<div>${escapeHtml(d)}</div>`).join("")}</div>` : ""}
+  </div>`;
+}
+
+function renderPass4Hero(item) {
+  const host = $("#hero");
+  if (!item) {
+    host.innerHTML = `<div class="hero-diff"><div class="hero-caption">Product</div><div class="hero-pn">—</div><div class="hero-desc">No item in queue.</div></div>`;
+    return;
+  }
+  const scored = scorePass4Product(item.product_number, item.description || "");
+  const st = normalizeStatus(state.decisions[item.product_number]?.status);
+  const orig = item.description || "(empty)";
+  const proposal = scored.proposal || orig;
+  const changed = proposal.trim() !== String(orig).trim();
+  const saved = String(state.decisions[item.product_number]?.note || "");
+  const applied = saved.startsWith("std:") ? saved.slice(4) : "";
+  const cat = scored.category;
+  const path = (cat?.path || []).join(" › ");
+  const fields = Array.isArray(scored.fields) ? scored.fields : [];
+  const chips = fields.map((f) => {
+    const label = f.present
+      ? `${f.name}: ${f.matched}`
+      : f.required
+        ? `missing ${f.name}`
+        : `${f.name} (optional)`;
+    const cls = f.present ? "add" : f.required ? "miss" : "opt";
+    return `<span class="chip ${cls}">${escapeHtml(label)}</span>`;
+  });
+  if (scored.templateMissing) {
+    chips.unshift(`<span class="chip miss">no field list in this dump</span>`);
+  }
+  host.innerHTML = `<div class="hero-diff p3-hero">
+    <div class="hero-caption">Pass 4 · naming convention</div>
+    <div class="hero-cand-head">
+      <div class="hero-pn">${escapeHtml(item.product_number)}</div>
+      <div class="status-chip ${st}">${escapeHtml(statusLabel(st))}</div>
+    </div>
+    <div class="hero-stream-label">Current name</div>
+    <div class="hero-desc">${escapeHtml(orig)}</div>
+    <div class="p3-meta">Category <strong>${escapeHtml(scored.family || "—")}</strong>
+      ${path ? ` · ${escapeHtml(path)}` : ""}
+      ${changed ? " · proposal differs" : ""}</div>
+    ${chips.length ? `<div class="chips">${chips.join("")}</div>` : ""}
+    ${changed ? `<div class="hero-stream-label">Proposed standard</div><div class="p4-proposal">${escapeHtml(proposal)}</div>` : ""}
+    ${applied && applied !== orig ? `<div class="hero-stream-label">Saved standardised name</div><div class="p4-proposal saved">${escapeHtml(applied)}</div>` : ""}
+    <div class="p3-reason">${escapeHtml(scored.reason || "Review this name.")}</div>
+    <div class="p4-hint">Standard → accepts the proposal (category + required fields, ALL CAPS, comma-separated). Non-standard ← flags it. Field lists: paste into <strong>NAMING_STANDARDS.js</strong> at the project root, then <code>node cloudflare-gate/scripts/build-naming-backbone.mjs</code>.</div>
+  </div>`;
 }
 
 function renderHero() {
@@ -2043,7 +2750,31 @@ async function pullIn(sug) {
 
 async function mark(status) {
   if (!state.selected) return;
-  await persistDecision(state.selected, status);
+  const extra = {};
+  if (isPass4() && (status === "standard" || status === "rewritten")) {
+    const item = state.catalog.by_product[state.selected];
+    const scored = scorePass4Product(state.selected, item?.description || "");
+    const orig = String(item?.description || "").trim();
+    const proposal = String(scored.proposal || orig).trim();
+    if (proposal && proposal !== orig) {
+      status = "rewritten";
+      extra.note = `std:${proposal}`;
+    }
+  }
+  await persistDecision(state.selected, status, extra);
+  if (isSingleItemPass()) {
+    const order = state.catalog.cluster_order || [];
+    for (let i = 1; i <= order.length; i++) {
+      const idx = (state.clusterIndex + i) % order.length;
+      const it = (state.catalog.clusters[order[idx]] || [])[0];
+      if (it && !state.decisions[it.product_number]) {
+        state.clusterIndex = idx;
+        break;
+      }
+    }
+    renderCluster();
+    return;
+  }
   const next =
     state.candidates.find(
       (pn) => pn !== state.selected && !state.decisions[pn],
@@ -2096,6 +2827,10 @@ async function prevCluster() {
 
 /** True when every child in the review queue for this parent is marked. */
 function clusterQueueFullyMarked(cid) {
+  if (isSingleItemPass()) {
+    const item = (state.catalog?.clusters?.[cid] || [])[0];
+    return Boolean(item && state.decisions[item.product_number]);
+  }
   const cands = clusterCandidates(state.catalog?.clusters?.[cid] || []);
   if (!cands.length) return true;
   return cands.every((c) => Boolean(state.decisions[c.product_number]));
@@ -2311,9 +3046,9 @@ function onKey(e) {
   }
 
   if (e.key === "ArrowLeft") {
-    mark("duplicate");
+    mark(markLeftStatus());
   } else if (e.key === "ArrowRight") {
-    mark("unique");
+    mark(markRightStatus());
   } else if (e.key === "ArrowUp") {
     mark("discard");
   } else if (e.key === "ArrowDown") {
@@ -2381,9 +3116,21 @@ function wireUpload() {
   });
 }
 
+function markLeftStatus() {
+  if (isPass4()) return "nonstandard";
+  if (isPass3()) return "insufficient";
+  return "duplicate";
+}
+
+function markRightStatus() {
+  if (isPass4()) return "standard";
+  if (isPass3()) return "ok";
+  return "unique";
+}
+
 function wireReview() {
-  $("#btnDup").addEventListener("click", () => mark("duplicate"));
-  $("#btnUnique").addEventListener("click", () => mark("unique"));
+  $("#btnDup").addEventListener("click", () => mark(markLeftStatus()));
+  $("#btnUnique").addEventListener("click", () => mark(markRightStatus()));
   $("#btnDiscard").addEventListener("click", () => mark("discard"));
   $("#btnClear").addEventListener("click", () => clearMark());
   $("#btnNext").addEventListener("click", () => nextCluster());
@@ -2406,6 +3153,17 @@ function wireReview() {
   });
   $("#btnReportsRefresh")?.addEventListener("click", () => renderReports());
   $("#btnReportsExcel")?.addEventListener("click", () => exportManagementExcel());
+  $("#btnReportsPass12")?.addEventListener("click", () => {
+    const id = pass2JobIdForConsolidate();
+    if (!id) {
+      alert("Open a Pass 2 job (or a Pass 3 job built from one), or use Export 1+2 on the Pass 2 / Pass 3 tab.");
+      return;
+    }
+    exportPass12FromJob(id, state.jobName || "").catch((e) => {
+      setProgress(false);
+      alert(e.message || String(e));
+    });
+  });
   $("#btnReportsBack")?.addEventListener("click", () => showReviewFromReports());
   $("#btnTimesheetRefresh")?.addEventListener("click", () => {
     loadTimesheet().catch((e) => alert(e.message || String(e)));

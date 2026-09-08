@@ -324,7 +324,7 @@ function appShell() {
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/app.css?v=23" />
+  <link rel="stylesheet" href="/app.css?v=27" />
   <script src="/xlsx.full.min.js?v=15"><\/script>
   <script>
     try {
@@ -358,6 +358,8 @@ function appShell() {
     <nav class="pass-tabs" aria-label="Review pass">
       <button type="button" class="pass-tab active" data-pass-tab="1">Pass 1</button>
       <button type="button" class="pass-tab" data-pass-tab="2">Pass 2</button>
+      <button type="button" class="pass-tab" data-pass-tab="3">Pass 3</button>
+      <button type="button" class="pass-tab" data-pass-tab="4">Pass 4</button>
     </nav>
 
     <section class="screen active" data-screen="upload">
@@ -375,9 +377,21 @@ function appShell() {
         </div>
         <div class="upload-card hidden" id="pass2Upload">
           <h1>Pass 2 \u2014 children as parents</h1>
-          <p>Every <strong>Pass 1 child</strong> becomes a parent and is matched against the <strong>full catalog</strong> (Jaccard \u2265 0.60). Products marked <strong>Duplicate</strong> in Pass 1 are pre-marked here. Pick a finished Pass 1 job to build from (uses that job\u2019s catalog + decisions).</p>
+          <p>Every <strong>Pass 1 child</strong> becomes a parent and is matched against the <strong>full catalog</strong> (Jaccard \u2265 0.60). Products marked <strong>Duplicate</strong> in Pass 1 are pre-marked here. Pick a finished Pass 1 job to build from (uses that job\u2019s catalog + decisions). <strong>Export 1+2</strong> on a Pass 2 job downloads the full Unique / Duplicate / Discard list.</p>
           <div class="job-list" id="pass1SourceList"></div>
           <div class="job-list" id="pass2JobList"></div>
+        </div>
+        <div class="upload-card hidden" id="pass3Upload">
+          <h1>Pass 3 \u2014 enough information?</h1>
+          <p>Not a duplicate pass. Each remaining product is checked for a usable description. <strong>S-codes</strong> (service / GL), <strong>DRYRUN</strong> and <strong>NO USAR</strong> are discarded automatically. Clear names are marked OK. The queue is the grey zone \u2014 flag <strong>Insufficient</strong> or <strong>OK</strong>. Build from a Pass 2 job (uses that catalog minus Duplicate / Discard). <strong>Export 1+2</strong> downloads Unique / Duplicate / Discard after both duplicate passes.</p>
+          <div class="job-list" id="pass2SourceList"></div>
+          <div class="job-list" id="pass3JobList"></div>
+        </div>
+        <div class="upload-card hidden" id="pass4Upload">
+          <h1>Pass 4 \u2014 naming convention</h1>
+          <p>Not a duplicate pass. Each remaining product is matched to a category (e.g. <strong>Cap screw</strong>) and checked against that type\u2019s required fields. Names must be <strong>ALL CAPS</strong>, comma-separated, type first: <em>CAP SCREW, field, field, field</em>. Paste today\u2019s field lists into <strong>NAMING_STANDARDS.js</strong> at the project root, then run <code>node scripts/build-naming-backbone.mjs</code> and rebuild this Pass 4 job. Missing required fields go to the queue.</p>
+          <div class="job-list" id="pass3SourceList"></div>
+          <div class="job-list" id="pass4JobList"></div>
         </div>
       </div>
     </section>
@@ -412,6 +426,7 @@ function appShell() {
           <div class="reports-actions">
             <button type="button" class="btn" id="btnReportsRefresh">Refresh</button>
             <button type="button" class="btn primary" id="btnReportsExcel">Export Excel\u2026</button>
+            <button type="button" class="btn" id="btnReportsPass12" hidden title="Full Unique / Duplicate / Discard after Pass 1 and 2">Export Pass 1+2\u2026</button>
             <button type="button" class="btn" id="btnReportsBack">\u2190 Back to review</button>
           </div>
         </div>
@@ -474,7 +489,7 @@ function appShell() {
     </section>
   </div>
   ${clientLocalStampScript()}
-  <script type="module" src="/app.js?v=29"><\/script>
+  <script type="module" src="/app.js?v=34"><\/script>
 </body>
 </html>`;
 }
@@ -616,7 +631,7 @@ async function handleApi(request, env, url, ctx) {
                       , COALESCE(pass_number, 1) AS pass_number, source_job_id
                FROM jobs`;
     const binds = [];
-    if (Number.isFinite(passNum) && (passNum === 1 || passNum === 2)) {
+    if (Number.isFinite(passNum) && passNum >= 1 && passNum <= 4) {
       sql += ` WHERE COALESCE(pass_number, 1) = ?`;
       binds.push(passNum);
     }
@@ -633,7 +648,7 @@ async function handleApi(request, env, url, ctx) {
          FROM jobs ORDER BY updated_at DESC LIMIT 50`
       ).all();
       results = (legacy || []).map((j) => ({ ...j, pass_number: 1, source_job_id: null }));
-      if (passNum === 2) results = [];
+      if (passNum === 2 || passNum === 3 || passNum === 4) results = [];
     }
     return json({ jobs: results });
   }
@@ -645,7 +660,8 @@ async function handleApi(request, env, url, ctx) {
     const ts = nowIso2();
     const nProducts = Number(body.n_products) || 0;
     const nClusters = Number(body.n_clusters) || 0;
-    const passNumber = Number(body.pass_number) === 2 ? 2 : 1;
+    const passRaw = Number(body.pass_number);
+    const passNumber = passRaw === 2 || passRaw === 3 || passRaw === 4 ? passRaw : 1;
     const sourceJobId = body.source_job_id ? String(body.source_job_id).slice(0, 64) : null;
     try {
       await env.DB.prepare(
@@ -804,8 +820,13 @@ async function handleApi(request, env, url, ctx) {
     } catch {
       cluster_order = [];
     }
+    const pass3 = Number(job.pass_number) === 3 || Number(job.pass_number) === 4;
+    const keepCluster = (cid) => {
+      const n = clusters[cid]?.length || 0;
+      return pass3 ? n >= 1 : n > 1;
+    };
     if (!cluster_order.length) {
-      cluster_order = Object.keys(clusters).map(Number).filter((cid) => (clusters[cid]?.length || 0) > 1).sort((a, b) => {
+      cluster_order = Object.keys(clusters).map(Number).filter(keepCluster).sort((a, b) => {
         const name = (cid) => {
           const items = clusters[cid] || [];
           const root = items.find((it) => Number(it.depth) === 0) || items[0];
@@ -814,7 +835,7 @@ async function handleApi(request, env, url, ctx) {
         return name(a).localeCompare(name(b)) || a - b;
       });
     } else {
-      cluster_order = cluster_order.filter((cid) => (clusters[cid]?.length || 0) > 1);
+      cluster_order = cluster_order.filter(keepCluster);
     }
     cluster_order = cluster_order.filter((cid) => clusters[cid]?.length);
     const semRows = await env.DB.prepare(

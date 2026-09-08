@@ -208,7 +208,7 @@ a { color: var(--teal); }
   font-size: 0.92rem;
 }
 .job-meta { color: var(--ink-muted); font-size: 0.8rem; }
-.job-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.job-actions { display: flex; gap: 8px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
 
 /* Review layout — narrow queue like desktop RAIL_W */
 .review-body {
@@ -284,6 +284,11 @@ a { color: var(--teal); }
 .q-item.unique .q-dot { border-color: var(--teal); background: var(--teal); }
 .q-item.discard .q-dot { border-color: var(--ochre); background: var(--ochre); }
 .q-item.skip .q-dot { border-color: var(--ink-muted); background: var(--ink-muted); }
+.q-item.ok .q-dot { border-color: var(--teal); background: var(--teal); }
+.q-item.insufficient .q-dot { border-color: var(--coral); background: var(--coral); }
+.q-item.standard .q-dot { border-color: var(--teal); background: var(--teal); }
+.q-item.rewritten .q-dot { border-color: var(--teal); background: var(--teal); }
+.q-item.nonstandard .q-dot { border-color: var(--coral); background: var(--coral); }
 
 /* Hero — MergedDiffHero layout */
 .hero {
@@ -339,6 +344,42 @@ a { color: var(--teal); }
 }
 .hero-stream-label.miss { color: var(--coral); }
 
+.p3-hero .p3-meta {
+  font-size: 0.86rem;
+  color: var(--ink-muted);
+  margin: 6px 0 8px;
+}
+.p3-hero .p3-reason {
+  margin: 10px 0 8px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--teal);
+  background: var(--surface);
+  font-size: 0.92rem;
+  line-height: 1.4;
+}
+.p3-hero .p3-peers {
+  font-size: 0.84rem;
+  color: var(--ink-muted);
+  line-height: 1.45;
+  margin-bottom: 8px;
+}
+.p3-hero .p3-peers.thin { color: var(--coral); }
+.p4-proposal {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.95rem;
+  line-height: 1.4;
+  padding: 10px 12px;
+  background: var(--surface);
+  border-left: 3px solid var(--teal);
+  margin: 4px 0 8px;
+}
+.p4-proposal.saved { border-left-color: var(--ochre); }
+.p4-hint {
+  font-size: 0.8rem;
+  color: var(--ink-muted);
+  margin-top: 8px;
+}
+
 .chips {
   display: flex;
   flex-wrap: wrap;
@@ -368,6 +409,12 @@ a { color: var(--teal); }
   border-color: var(--chip-removed-bg);
   text-decoration: line-through;
   text-decoration-thickness: 2px;
+}
+.chip.opt {
+  background: var(--surface);
+  color: var(--ink-muted);
+  border-color: var(--rail-line);
+  border-style: dashed;
 }
 .chip.drawing {
   background: var(--chip-drawing-bg);
@@ -410,6 +457,11 @@ a { color: var(--teal); }
 .status-chip.unique { color: #f7f8fa; background: var(--teal); }
 .status-chip.discard { color: #f7f8fa; background: var(--ochre); }
 .status-chip.skip { color: #f7f8fa; background: var(--ink-muted); }
+.status-chip.ok { color: #f7f8fa; background: var(--teal); }
+.status-chip.insufficient { color: #f7f8fa; background: var(--coral); }
+.status-chip.standard { color: #f7f8fa; background: var(--teal); }
+.status-chip.rewritten { color: #f7f8fa; background: var(--teal); }
+.status-chip.nonstandard { color: #f7f8fa; background: var(--coral); }
 
 .score-row {
   display: flex;
