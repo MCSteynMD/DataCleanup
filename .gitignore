@@ -27,3 +27,7 @@ Desktop.ini
 .DS_Store
 .idea/
 .vscode/
+
+# Keep corrected Pass 1+2 consolidated export
+!reports/
+!reports/pass12_consolidated_corrected.xlsx
